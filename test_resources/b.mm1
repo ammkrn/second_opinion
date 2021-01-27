@@ -1,0 +1,8 @@
+import "d.mm1";
+import "e.mm1";
+
+delimiter $ ( [ { ~ $
+          $ } ] ) , $;
+strict provable sort BB;
+term termB1 (p: DD): BB; 
+term termB2 (p: EE): BB;

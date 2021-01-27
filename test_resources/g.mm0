@@ -1,0 +1,3 @@
+strict provable sort GG;
+term termG1 (p: GG): GG; 
+term termG2 (p: GG): GG;

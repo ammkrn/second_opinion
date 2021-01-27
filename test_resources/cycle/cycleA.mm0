@@ -1,0 +1,3 @@
+import "cycleB.mm0";
+strict provable sort A;
+term termA (p: A): A; 

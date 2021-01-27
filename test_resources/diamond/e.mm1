@@ -1,0 +1,3 @@
+strict provable sort EE;
+term termE1 (p: EE): EE; 
+term termE2 (p: EE): EE;

@@ -1,0 +1,6 @@
+import "b.mm1";
+import "c.mm1";
+
+strict provable sort AA;
+term termA1 (p: AA): AA; 
+term termA2 : AA > BB > CC;

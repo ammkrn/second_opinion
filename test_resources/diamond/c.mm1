@@ -1,0 +1,6 @@
+import "e.mm1";
+import "f.mm1";
+import "g.mm1";
+strict provable sort CC;
+term termC1 (p: EE): FF; 
+term termC2 (p: GG): CC;

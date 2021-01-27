@@ -1,0 +1,6 @@
+import "d.mm0";
+import "e.mm0";
+
+strict provable sort BB;
+term termB1 (p: DD): BB; 
+term termB2 (p: EE): BB;

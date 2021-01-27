@@ -1,0 +1,3 @@
+strict provable sort DD;
+term termD1 (p: DD): DD; 
+term termD2 (p: DD): DD;

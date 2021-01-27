@@ -1,13 +1,12 @@
+use bumpalo::collections::Vec as BumpVec;
 use crate::util::{
     VerifErr,
     Res,
 };
 use crate::mmb::{
     MmbItem,
-    MmbList::*,
     MmbState,
-    MmbPtr,
-    MmbListPtr,
+    MmbExpr
 };
 
 use crate::util::try_next_cmd;
@@ -152,9 +151,9 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         &mut self, 
         mode: UMode,
         unify: UnifyIter,
-        tgt: MmbPtr<'a>,
+        tgt: &'b MmbItem<'b>,
     ) -> Res<()> {    
-        self.mem.ustack.push(tgt);
+        self.ustack.push(tgt);
 
         for maybe_cmd in unify {
             match maybe_cmd? {
@@ -165,16 +164,16 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
             }
         }
 
-        make_sure!(self.mem.ustack.is_empty());
+        make_sure!(self.ustack.is_empty());
         if mode == UMode::UThmEnd {
-            make_sure!(self.mem.hstack.is_empty());
+            make_sure!(self.hstack.is_empty());
         }
-        Ok(self.mem.uheap.clear())
+        Ok(self.uheap.clear())
     }
 
     fn unify_ref(&mut self, i: u32) -> Res<()> {
-        let heap_elem = none_err!(self.mem.uheap.get(i as usize).copied())?;
-        let ustack_elem = none_err!(self.mem.ustack.pop())?;
+        let heap_elem = none_err!(self.uheap.get(i as usize).copied())?;
+        let ustack_elem = none_err!(self.ustack.pop())?;
         if heap_elem != ustack_elem {
             Err(VerifErr::Msg(format!("Bad unify ref")))
         } else {
@@ -182,10 +181,9 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         }
     }
 
-    pub fn push_ustack_rev_mmb(&mut self, items: MmbListPtr<'a>) {
-        if let Cons(hd, tl) = items.read(self) {
-            self.push_ustack_rev_mmb(tl);
-            self.mem.ustack.push(hd);
+    pub fn push_ustack_rev_mmb(&mut self, items: &'b BumpVec<'b, &'b MmbItem<'b>>) {
+        for elem in items.iter().rev() {
+            self.ustack.push(elem)
         }
     }
 
@@ -194,16 +192,16 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         term_num: u32,
         save: bool
     ) -> Res<()> {
-        let p = none_err!(self.mem.ustack.pop())?;
-        if let MmbItem::App { term_num:id2, args, .. } = p.read(self) {
-            make_sure!(term_num == id2);
+        let p = none_err!(self.ustack.pop())?;
+        if let MmbItem::Expr(MmbExpr::App { term_num:id2, args, .. }) = p {
+            make_sure!(term_num == *id2);
             self.push_ustack_rev_mmb(args);
             if save {
-                self.mem.uheap.push(p)
+                self.uheap.push(p)
             }
             Ok(())
         } else {
-            unreachable!()
+            return Err(VerifErr::Unreachable(file!(), line!()));
         }
     }        
 
@@ -213,37 +211,37 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         sort_id: u8,
     ) -> Res<()> {
         make_sure!(mode == UMode::UDef);
-        let p = self.mem.ustack.pop().unwrap();
-        if let MmbItem::Var { ty, .. } = p.read(self) {
+        let p = self.ustack.pop().unwrap();
+        if let MmbItem::Expr(MmbExpr::Var { ty, .. }) = p {
             make_sure!(sort_id == ty.sort());
             // assert that ty is bound, and get its bv idx (0-55);
             let bound_idx = ty.bound_digit()?;
             // ty has no dependencies
-            for heap_elem in self.mem.uheap.iter() {
-                let ty = heap_elem.get_ty(self).unwrap();
+            for heap_elem in self.uheap.iter() {
+                let ty = heap_elem.get_ty().unwrap();
                 make_sure!(ty.inner & bound_idx == 0);
             }
 
-            Ok(self.mem.uheap.push(p))
+            Ok(self.uheap.push(p))
         } else {
-            unreachable!()
+            return Err(VerifErr::Unreachable(file!(), line!()));
         }
     }    
 
     fn unify_hyp(&mut self, mode: UMode) -> Res<()> {
         if let UMode::UThm = mode {
-            let proof = none_err!(self.mem.stack.pop())?;
-            if let MmbItem::Proof(e) = proof.read(self) {
-                Ok(self.mem.ustack.push(e))
+            let proof = none_err!(self.stack.pop())?;
+            if let MmbItem::Proof(e) = proof {
+                Ok(self.ustack.push(e))
             } else {
-                unreachable!()
+                return Err(VerifErr::Unreachable(file!(), line!()));
             }
         } else if let UMode::UThmEnd = mode {
-            make_sure!(self.mem.ustack.is_empty());
-            let elem = self.mem.hstack.pop().unwrap();
-            Ok(self.mem.ustack.push(elem))
+            make_sure!(self.ustack.is_empty());
+            let elem = self.hstack.pop().unwrap();
+            Ok(self.ustack.push(elem))
         } else {
-            unreachable!()
+            return Err(VerifErr::Unreachable(file!(), line!()));
         }
     }    
 

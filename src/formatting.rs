@@ -3,7 +3,6 @@
 
 use std::fmt::{ Debug, Formatter, Result as FmtResult };
 use crate::util::Type;
-use crate::mmb::{ MmbState, MmbItem, MmbList, MmbPtr, MmbListPtr, MmbList::* };
 use crate::mmz::{ MmzState, MathStr, MathStrPtr, MmzPtr, MmzList, MmzListPtr, MathStr::*, MmzItem };
 
 
@@ -27,69 +26,6 @@ impl<'b, 'a: 'b, S: Copy, A> Fmtr<S, A> {
         }
     }
 }
-
-impl<'b, 'a: 'b> Debug for Fmtr<&MmbState<'b, 'a>, MmbPtr<'a>> {
-    fn fmt(&self, f: &mut Formatter) -> FmtResult {
-        self.with(self.elem.read(self.state)).fmt(f)
-    }
-}
-
-impl<'b, 'a: 'b> Debug for Fmtr<&MmbState<'b, 'a>, MmbItem<'a>> {
-    fn fmt(&self, f: &mut Formatter) -> FmtResult {
-        match self.elem {
-
-            MmbItem::Var { idx, ty } => {
-                let mut d = f.debug_struct("Var");
-                d.field("idx", &idx);
-                d.field("ty", &ty);
-                d.finish()                
-            },
-            MmbItem::App { term_num, args, ty } => {
-                let mut d = f.debug_struct("App");
-                d.field("term_num", &term_num);
-                d.field("args", &self.with(args));
-                d.field("ty", &ty);
-                d.finish()
-            },
-            MmbItem::Proof(p) => {
-                let mut d = f.debug_struct("Proof");
-                d.field("proof", &self.with(p));
-                d.finish()
-            }
-            MmbItem::Conv(c1, c2) => {
-                let mut d = f.debug_struct("Conv");
-                d.field("c1", &self.with(c1));
-                d.field("c2", &self.with(c2));
-                d.finish()
-            }
-            MmbItem::CoConv(cc1, cc2) => {
-                let mut d = f.debug_struct("Expr::CoConv");
-                d.field("cc1", &self.with(cc1));
-                d.field("cc2", &self.with(cc2));
-                d.finish()
-            }            
-        }
-    }
-}
-
-impl<'b, 'a: 'b> Debug for Fmtr<&MmbState<'b, 'a>, MmbListPtr<'a>> {
-    fn fmt(&self, f: &mut Formatter) -> FmtResult {
-        self.with(self.elem.read(self.state)).fmt(f)
-    }
-}
-
-impl<'b, 'a: 'b> Debug for Fmtr<&MmbState<'b, 'a>, MmbList<'a>> {
-    fn fmt(&self, f: &mut Formatter) -> FmtResult {
-        let mut cursor = self.elem;
-        let mut d = f.debug_list();
-        while let Cons(hd, tl) = cursor {
-            d.entry(&self.with(hd.read(self.state)));
-            cursor = tl.read(self.state);
-        }
-        d.finish()
-    }
-}
-
 
 impl<'b, 'a: 'b> Debug for Fmtr<&MmzState<'b, 'a>, MathStrPtr<'a>> {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {

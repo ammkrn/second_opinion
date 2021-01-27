@@ -239,7 +239,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         let tok = none_err!(self.math_tok())?;
         if let Some(q) = self.mem.consts.get(&tok).copied() {
             self.prefix_const(this_prec, &tok, q)
-        } else if let Some(mmz_var) = self.mem.vars_done.iter().find(|v| v.ident == Some(tok)) {
+        } else if let Some(mmz_var) = self.vars_done.iter().find(|v| v.ident == Some(tok)) {
             Ok((mmz_var.to_parse_var(), mmz_var.ty.sort()))
         } else {
             self.prefix_ident(this_prec, &tok)

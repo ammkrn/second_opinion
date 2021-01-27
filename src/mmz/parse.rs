@@ -21,7 +21,6 @@ use crate::util::{
     Res, 
     VerifErr, 
     SortNum,
-    FxIndexMap,
     FxMap,
     Type,
     Either, 
@@ -106,13 +105,13 @@ impl<'b, 'a: 'b> MmzMem<'a> {
 
     pub fn parse_until(
         &mut self,
+        bump: &mut bumpalo::Bump,
         stmt_cmd: StmtCmd, 
         item: Option<Either<Term<'a>, Assert<'a>>>
     ) -> Res<()> {
         'outer: loop {
             'inner: loop {
-
-                let mut mmz_st = MmzState::from(&mut *self);
+                let mut mmz_st = MmzState::new_from(&mut *self, bump);
                 if mmz_st.cur().is_none() {
                     break 'inner
                 }
@@ -124,7 +123,7 @@ impl<'b, 'a: 'b> MmzMem<'a> {
                             return mmz_st.parse_termdef(t)
 
                         } else {
-                            unreachable!()
+                            return Err(VerifErr::Unreachable(file!(), line!()));
                         }
                     }
                     b"axiom" | b"theorem" => {
@@ -132,7 +131,7 @@ impl<'b, 'a: 'b> MmzMem<'a> {
                         if let Some(R(assert)) = item {
                             return mmz_st.parse_assert(assert)
                         } else {
-                            unreachable!()
+                            return Err(VerifErr::Unreachable(file!(), line!()));
                         }
                      },
                      b"delimiter" => mmz_st.delims()?,
@@ -381,7 +380,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 }
 
 fn add_nota_info<'a>(
-    m: &mut FxIndexMap<Str<'a>, NotationInfo<'a>>,
+    m: &mut FxMap<Str<'a>, NotationInfo<'a>>,
     tok: Str<'a>,
     n: NotationInfo<'a>,
 ) -> Res<()> {
@@ -441,18 +440,16 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         Ok(())
     }
 
-    fn add_const(&mut self, tk: Str<'a>, prec: Prec) {
+    fn add_const(&mut self, tk: Str<'a>, prec: Prec) -> Res<()> {
         if tk.as_bytes() == b"(" || tk.as_bytes() == b")" {
-            panic!("Parens not allowed as notation consts");
+            return Err(VerifErr::Msg(format!("Parens not allowed as notation consts")));
         }
 
-        if let Some(x) = self.mem.consts.insert(tk, prec) {
-            if x != prec {
-                println!("Cannot redeclare const {:?}", tk);
-                println!("prec1: {:?}\n", prec);
-                println!("prec2: {:?}\n", x);
-                panic!()
-            }
+        match self.mem.consts.insert(tk, prec) {
+            Some(already) if already != prec => {
+                Err(VerifErr::Msg(format!("Cannot redeclare const {:?} with new prec", tk)))
+            },
+            _ => Ok(())
         }
     }    
 
@@ -463,7 +460,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         term_num_args: u16,
         lits: Vec<Either<(Str<'a>, Prec), Str<'a>>>,
     ) -> Res<()> {
-        let num_args_nota = self.mem.vars_done.len();
+        let num_args_nota = self.vars_done.len();
         assert_eq!(num_args_nota, term_num_args as usize);
 
         let mut vars_used = Vec::new();
@@ -475,7 +472,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             Some(R(_)) => panic!("generalized infix not allowed in mm0")
         };
 
-        self.add_const(*tok, prec.clone());
+        self.add_const(*tok, prec.clone())?;
         if it.peek().is_none() {
             right_associative = false;
         }
@@ -484,7 +481,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             match *lit {
                 L((tok, prec)) => {
                     lits2.push(NotationLit::Const(tok));
-                    self.add_const(tok, prec)
+                    self.add_const(tok, prec)?
                 }
                 R(var_ident) => {
                     let prec = match it.peek() {
@@ -493,13 +490,13 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                         Some(R(_)) => Prec::Max,
                     };
                     vars_used.push(var_ident);
-                    let pos = self.mem.vars_done.iter().position(|v| v.ident == Some(var_ident)).unwrap();
+                    let pos = self.vars_done.iter().position(|v| v.ident == Some(var_ident)).unwrap();
                     lits2.push(NotationLit::Var { pos, prec })
                 }
             }
         }        
 
-        for sig_var in self.mem.vars_done.iter() {
+        for sig_var in self.vars_done.iter() {
             if let Some(ident) = sig_var.ident {
                 // Dummy variables not allowed in `notation` declarations.
                 make_sure!(!sig_var.is_dummy);
@@ -526,7 +523,6 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         //.push((*tok, None));        
 
         add_nota_info(&mut self.mem.prefixes, *tok, info)
-
     }
 
     fn prec_const(&mut self) -> Res<(Str<'a>, Prec)> {
@@ -703,7 +699,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             lits.push(NotationLit::Var { pos: n as usize, prec });
         }
 
-        self.mem.consts.insert(constant, prec);
+        self.add_const(constant, prec)?;
 
         let info = NotationInfo {
             term_num: term.term_num,
@@ -756,7 +752,8 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                         NotationLit::Var { pos: 1, prec: Prec::Num(i2) }
                     ]
                 };
-                self.mem.consts.insert(constant, prec);
+
+                self.add_const(constant, prec)?;
 
                 let info = NotationInfo {
                     term_num: term.term_num,
@@ -837,7 +834,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         make_sure!(self.kw(b"axiom ").or(self.kw(b"theorem ")).is_some());
         let ident = self.ident().unwrap();
         let _binders = self.binders(assert.args(), "assert")?;
-        let tgt = self.mem.hyps.pop().unwrap().expr;
+        let tgt = self.hyps.pop().unwrap().expr;
         self.check_expr(
             assert.unify(),
             tgt,
@@ -880,13 +877,13 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             let args_todo = args.skip(self.non_dummy_vars().count());
             match self.binder_group(args_todo, mode) {
                 Ok(_) => {
-                    todo_len = self.mem.vars_todo.len();
-                    done_len = self.mem.vars_done.len();
+                    todo_len = self.vars_todo.len();
+                    done_len = self.vars_done.len();
                     continue
                 }
                 Err(_) => {
-                    self.mem.vars_todo.truncate(todo_len);
-                    self.mem.vars_done.truncate(done_len);
+                    self.vars_todo.truncate(todo_len);
+                    self.vars_done.truncate(done_len);
                     break
                 }
             }
@@ -905,9 +902,9 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                 [b'.', tl @ ..] => {
                     make_sure!(mode == "def");
                     let new_ident = Str::dedup(tl, self);
-                    self.mem.vars_todo.push((new_ident, true))
+                    self.vars_todo.push((new_ident, true))
                 },
-                _ => self.mem.vars_todo.push((var_ident, false))
+                _ => self.vars_todo.push((var_ident, false))
             }
         }
         Ok(())
@@ -962,10 +959,10 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         make_sure!(mode == "assert");
         let (math_expr, math_sort) = self.expr(Prec::Num(0))?;
         let math_expr = self.coerce(math_expr, math_sort,self.mem.coe_prov_or_else(math_sort))?;
-        for (ident, dummy) in self.mem.vars_todo.iter().skip(self.mem.vars_done.len()) {
+        for (ident, dummy) in self.vars_todo.iter().skip(self.vars_done.len()) {
             make_sure!(!dummy);
-            let pos = self.mem.vars_done.len();
-            self.mem.hyps.push(MmzHyp { 
+            let pos = self.vars_done.len();
+            self.hyps.push(MmzHyp { 
                 ident: Some(*ident),
                 pos: Some(pos), 
                 expr: math_expr
@@ -991,9 +988,9 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             }
         }
 
-        for (ident, dummy) in self.mem.vars_todo.iter().skip(self.mem.vars_done.len()) {
-            let pos = self.mem.vars_done.len();
-            self.mem.vars_done.push(MmzVar { 
+        for (ident, dummy) in self.vars_todo.iter().skip(self.vars_done.len()) {
+            let pos = self.vars_done.len();
+            self.vars_done.push(MmzVar { 
                 ident: Some(*ident),
                 pos, 
                 ty: ty_accum,
@@ -1010,7 +1007,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                 make_sure!(mode == "assert"); 
                 let (math_expr, math_sort) = self.expr_(Prec::Num(0))?;
                 let math_expr = self.coerce(math_expr, math_sort,self.mem.coe_prov_or_else(math_sort))?;
-                self.mem.hyps.push(MmzHyp { ident: None, pos: None, expr: math_expr });
+                self.hyps.push(MmzHyp { ident: None, pos: None, expr: math_expr });
             } else {
                 // If it's an arrow type.
                 let sort_ident = self.ident()?;
@@ -1038,7 +1035,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         if let Cons(hd, tl) = items {
             self.push_ustack_rev_mmz(tl.read(self));
             let hd_ = hd.read(self);
-            self.mem.ustack.push(hd_);
+            self.ustack.push(hd_);
         }
     }
 
@@ -1048,28 +1045,28 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         tgt: MmzItem<'a>,
         mode: UMode,
     ) -> Res<()> {
-        self.mem.ustack.push(tgt);
+        self.ustack.push(tgt);
 
-        for v in self.mem.vars_done.iter().filter(|v| !v.is_dummy) {
-            self.mem.uheap.push(v.to_parse_var());
+        for v in self.vars_done.iter().filter(|v| !v.is_dummy) {
+            self.uheap.push(v.to_parse_var());
         }
 
         for maybe_cmd in u {
             match maybe_cmd? {
                 UnifyCmd::Ref(i) => {
-                    let heap_elem = *&self.mem.uheap[i as usize];
-                    let stack_elem = none_err!(self.mem.ustack.pop())?;
+                    let heap_elem = *&self.uheap[i as usize];
+                    let stack_elem = none_err!(self.ustack.pop())?;
                     if heap_elem != stack_elem {
                         return Err(VerifErr::Msg(format!("check_expr Ref eq test went bad")))
                     }
                 }
                 UnifyCmd::Term { term_num, save } => {
-                    let p = none_err!(self.mem.ustack.pop())?;
+                    let p = none_err!(self.ustack.pop())?;
                     if let MmzItem::App { term_num:n2, args, .. } = p {
                         make_sure!(term_num == n2);
                         self.push_ustack_rev_mmz(args);
                         if save {
-                            self.mem.uheap.push(p);
+                            self.uheap.push(p);
                         }
                     } else {
                         return Err(VerifErr::Msg(format!("UnifyCmd expected term")))
@@ -1077,19 +1074,19 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                 },
                 UnifyCmd::Dummy { sort_id } => {
                     make_sure!(mode == UMode::UDef);
-                    let p = none_err!(self.mem.ustack.pop())?;
+                    let p = none_err!(self.ustack.pop())?;
                     if let MmzItem::Var { ty, is_dummy, .. } = p {
                         make_sure!(sort_id == ty.sort());
                         make_sure!(is_dummy);
-                        self.mem.uheap.push(p)
+                        self.uheap.push(p)
                     } else {
                         return localize!(Err(VerifErr::Msg(format!("check_expr failed at dummy"))))
                     }
                 }
-                UnifyCmd::Hyp => self.mem.ustack.push(none_err!(self.mem.hyps.pop())?.expr),
+                UnifyCmd::Hyp => self.ustack.push(none_err!(self.hyps.pop())?.expr),
             }
         }
-        Ok(self.mem.uheap.clear())
+        Ok(self.uheap.clear())
     }
 }
 

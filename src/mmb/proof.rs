@@ -1,3 +1,5 @@
+use bumpalo::collections::Vec as BumpVec;
+
 use crate::mmb::sorts_compatible;
 use crate::mmb::unify::UMode;
 use crate::util::{ 
@@ -9,8 +11,7 @@ use crate::util::{
 use crate::mmb::{
     MmbState,
     MmbItem,
-    MmbListPtr,
-    MmbList::*,
+    MmbExpr
 };
 
 pub const TYPE_BOUND_MASK: u64 = 1 << 63;
@@ -292,21 +293,21 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
     }    
 
     fn proof_ref(&mut self, i: u32) -> Res<()> {
-        let heap_elem = *&self.mem.heap[i as usize];
-        Ok(self.mem.stack.push(heap_elem))
+        let heap_elem = *&self.heap[i as usize];
+        Ok(self.stack.push(heap_elem))
     }
 
     fn proof_dummy(&mut self, sort_num: u8) -> Res<()> {
-        make_sure!(sort_num < self.mem.outline.header.num_sorts);
-        make_sure!(self.mem.outline.get_sort_mods(sort_num as usize).unwrap().inner & crate::mmb::SORT_STRICT == 0);
+        make_sure!(sort_num < self.outline.header.num_sorts);
+        make_sure!(self.outline.get_sort_mods(sort_num as usize).unwrap().inner & crate::mmb::SORT_STRICT == 0);
         // Owise too many bound variables.
         make_sure!(self.next_bv >> 56 == 0);
 
         let ty = Type { inner: TYPE_BOUND_MASK | ((sort_num as u64) << 56) | self.take_next_bv() };
 
-        let e = MmbItem::Var { idx: self.mem.heap.len(), ty }.alloc(self);
-        self.mem.stack.push(e);
-        Ok(self.mem.heap.push(e))
+        let e = self.alloc(MmbItem::Expr(self.alloc(MmbExpr::Var { idx: self.heap.len(), ty })));
+        self.stack.push(e);
+        Ok(self.heap.push(e))
     }        
 
 
@@ -316,14 +317,14 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         term_num: u32,
         save: bool
     ) -> Res<()> {
-        make_sure!(term_num < self.mem.outline.header.num_terms);
-        let termref = self.mem.outline.get_term_by_num(term_num)?;
+        make_sure!(term_num < self.outline.header.num_terms);
+        let termref = self.outline.get_term_by_num(term_num)?;
         
         // remove ebar from the stack; either variables or applications.
         // We don't actually drain the elements from the stack until the end
         // in order to avoid an allocation.
-        let drain_from = self.mem.stack.len() - (termref.num_args_no_ret() as usize);
-        let stack_args = &self.mem.stack[drain_from..];
+        let drain_from = self.stack.len() - (termref.num_args_no_ret() as usize);
+        let stack_args = &self.stack[drain_from..];
 
         // (sig_args, stack_args)
         let all_args = || { termref.args_no_ret().zip(stack_args.iter()) };
@@ -331,7 +332,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         // Arguments from the stack (and their positions, starting from 1) that the stack demands be bound.
         let stack_bound_by_sig = all_args().filter_map(|(sig, stack)| {
             if sig.is_bound() {
-                Some(stack.get_bound_digit(self))
+                Some(stack.get_bound_digit())
             } else {
                 None
             }
@@ -340,7 +341,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
 
         // For all of the args, make sure the stack and sig items have compatible sorts.
         for (sig_arg, stack_arg) in all_args() {
-            make_sure!(sorts_compatible(stack_arg.get_ty(self)?, sig_arg)) 
+            make_sure!(sorts_compatible(stack_arg.get_ty()?, sig_arg)) 
         }
 
         // Start building the new return type now that we know we have the right sort.
@@ -348,7 +349,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
 
         // For the args not bound by the signature...
         for (sig_unbound, stack_arg) in all_args().filter(|(sig, _)| !sig.is_bound()) {
-            let mut stack_lowbits = stack_arg.get_deps(self).or(stack_arg.get_bound_digit(self))?;
+            let mut stack_lowbits = stack_arg.get_deps().or(stack_arg.get_bound_digit())?;
             if mode == Mode::Def {
                 for (idx, dep) in stack_bound_by_sig.clone().enumerate() {
                     if sig_unbound.depends_on_((idx + 1) as u64) {
@@ -370,22 +371,22 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         }        
 
         // I think this will get around it.
-        let mut stack_args_out = Nil.alloc(self);
-        for _ in 0..termref.num_args_no_ret() {
-            let hd = none_err!(self.mem.stack.pop())?;
-            stack_args_out = Cons(hd, stack_args_out).alloc(self);
-        }   
+        let drain = self.stack.drain((self.stack.len() - (termref.num_args_no_ret() as usize))..);
+        let mut stack_args_out = BumpVec::new_in(self.bump);
+        for elem in drain {
+            stack_args_out.push(elem);
+        }
 
-        let t = MmbItem::App {
+        let t = self.alloc(MmbItem::Expr(self.alloc(MmbExpr::App {
             term_num,
             ty: new_type_accum,
-            args: stack_args_out,
-        }.alloc(self);
+            args: self.alloc(stack_args_out),
+        })));
 
         if save {
-            self.mem.heap.push(t);
+            self.heap.push(t);
         }        
-        Ok(self.mem.stack.push(t))
+        Ok(self.stack.push(t))
     }       
 
     fn proof_thm(
@@ -393,26 +394,26 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         thm_num: u32,
         save: bool
     ) -> Res<()> {
-        make_sure!(thm_num < self.mem.outline.header.num_thms);
-        let thmref = self.mem.outline.get_assert_by_num(thm_num)?;
+        make_sure!(thm_num < self.outline.header.num_thms);
+        let thmref = self.outline.get_assert_by_num(thm_num)?;
         let sig_args = thmref.args();
 
-        let a = none_err!(self.mem.stack.pop())?;
+        let a = none_err!(self.stack.pop())?;
 
         // Wait to remove these in order to save an allocation.
-        let drain_from = self.mem.stack.len() - sig_args.len();
-        let stack_args = &self.mem.stack[drain_from..];
+        let drain_from = self.stack.len() - sig_args.len();
+        let stack_args = &self.stack[drain_from..];
 
         let bound_by_sig = sig_args.zip(stack_args).enumerate().filter(|(_, (sig, _))| sig.is_bound());
 
-        self.mem.uheap.extend(stack_args.into_iter());
+        self.uheap.extend(stack_args.into_iter());
 
         let mut bound_len = 0usize;
         // For each variable bound by the signature...
         for (idx, (_, stack_a)) in bound_by_sig.clone() {
             bound_len += 1;
             for j in 0..idx {
-                make_sure!(*&self.mem.uheap[j].get_ty(self).unwrap().disjoint(stack_a.low_bits(self)))
+                make_sure!(*&self.uheap[j].get_ty().unwrap().disjoint(stack_a.low_bits()))
             }
         }
 
@@ -421,20 +422,20 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
             for j in 0..bound_len {
                 make_sure!(
                     !(sig_a.disjoint(Type { inner: 1 << j }))
-                    || bound_by_sig.clone().nth(j).unwrap().1.1.clone().low_bits(self).disjoint(stack_a.low_bits(self))
+                    || bound_by_sig.clone().nth(j).unwrap().1.1.clone().low_bits().disjoint(stack_a.low_bits())
                 )
             }
         }
 
         // Now we actually remove the stack_args from the stack
-        self.mem.stack.truncate(drain_from);
+        self.stack.truncate(drain_from);
         self.run_unify(UMode::UThm, thmref.unify(), a)?;
 
-        let proof = MmbItem::Proof(a).alloc(self);
+        let proof = self.alloc(MmbItem::Proof(a));
         if save {
-            self.mem.heap.push(proof);
+            self.heap.push(proof);
         }
-        Ok(self.mem.stack.push(proof))
+        Ok(self.stack.push(proof))
     }          
     
 
@@ -443,144 +444,130 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         mode: Mode,
     ) -> Res<()> {
         make_sure!(mode != Mode::Def);
-        let e = none_err!(self.mem.stack.pop())?;
+        let e = none_err!(self.stack.pop())?;
         //assert that e is in a provable sort since it's a hyp
-        let e_sort_numx = e.get_ty(self)?.sort();
-        let e_sort_mods = self.mem.outline.get_sort_mods(e_sort_numx as usize).unwrap().inner;
+        let e_sort_numx = e.get_ty()?.sort();
+        let e_sort_mods = self.outline.get_sort_mods(e_sort_numx as usize).unwrap().inner;
         make_sure!(e_sort_mods & crate::mmb::SORT_PROVABLE != 0);
-        self.mem.hstack.push(e);
-        let proof = MmbItem::Proof(e).alloc(self);
-        Ok(self.mem.heap.push(proof))
+        self.hstack.push(e);
+        let proof = self.alloc(MmbItem::Proof(e));
+        Ok(self.heap.push(proof))
     }      
 
 
     fn proof_conv(&mut self) -> Res<()> {
-        let e2proof = none_err!(self.mem.stack.pop())?;
-        let e1 = none_err!(self.mem.stack.pop())?;
-        match e2proof.read(self) {
+        let e2proof = none_err!(self.stack.pop())?;
+        let e1 = none_err!(self.stack.pop())?;
+        match e2proof {
             MmbItem::Proof(conc) => {
-                let e1proof = MmbItem::Proof(e1).alloc(self);
-                self.mem.stack.push(e1proof);
-                let coconv_e1_e2 = MmbItem::CoConv(e1, conc).alloc(self);
-                Ok(self.mem.stack.push(coconv_e1_e2))
+                let e1proof = self.alloc(MmbItem::Proof(e1));
+                self.stack.push(e1proof);
+                let coconv_e1_e2 = self.alloc(MmbItem::CoConv(e1, conc));
+                Ok(self.stack.push(coconv_e1_e2))
             },
-            _ => unreachable!()
+            _ => return Err(VerifErr::Unreachable(file!(), line!()))
         }        
     }      
 
     fn proof_refl(&mut self) -> Res<()> {
-        let e = none_err!(self.mem.stack.pop())?;
-        if let MmbItem::CoConv(cc1, cc2) = e.read(self) {
-            Ok(make_sure!(cc1 == cc2))
+        let e = none_err!(self.stack.pop())?;
+        if let MmbItem::CoConv(cc1, cc2) = e {
+            Ok(make_sure!((*cc1) as *const _ == (*cc2) as *const _))
         } else {
-            unreachable!()
+            return Err(VerifErr::Unreachable(file!(), line!()));
         }
     }      
 
     fn proof_sym(&mut self) -> Res<()> {
-        let e = none_err!(self.mem.stack.pop())?;
-        if let MmbItem::CoConv(cc1, cc2) = e.read(self) {
-            let rev = MmbItem::CoConv(cc2, cc1).alloc(self);
-            Ok(self.mem.stack.push(rev))
+        let e = none_err!(self.stack.pop())?;
+        if let MmbItem::CoConv(cc1, cc2) = e {
+            let swapped = self.alloc(MmbItem::CoConv(cc2, cc1));
+            Ok(self.stack.push(swapped))
         } else {
-            unreachable!()
+            return Err(VerifErr::Unreachable(file!(), line!()));
         }
     }      
 
     fn proof_cong(&mut self) -> Res<()> {
-        let e = none_err!(self.mem.stack.pop())?;
-        if let MmbItem::CoConv(cc1, cc2) = e.read(self)  {
-            match (cc1.read(self), cc2.read(self)) {
-                (MmbItem::App { term_num: n1, args: as1, .. }, MmbItem::App { term_num: n2, args: as2, .. }) => {
+        let e = none_err!(self.stack.pop())?;
+        if let MmbItem::CoConv(cc1, cc2) = e  {
+            match (cc1, cc2) {
+                (MmbItem::Expr(MmbExpr::App { term_num: n1, args: as1, .. }), MmbItem::Expr(MmbExpr::App { term_num: n2, args: as2, .. })) => {
                     make_sure!(n1 == n2);
-                    self.cong_push_rev((as1, as2))
+                    make_sure!(as1.len() == as2.len());
+                    for (lhs, rhs) in as1.iter().zip(as2.iter()).rev() {
+                        let cc = self.alloc(MmbItem::CoConv(lhs, rhs));
+                        self.stack.push(cc);
+                    }
+                    Ok(())
                 },
-                _ => unreachable!()
+                _ => return Err(VerifErr::Unreachable(file!(), line!()))
             }
         } else {
-            unreachable!()
+            return Err(VerifErr::Unreachable(file!(), line!()));
         }
     }      
 
-    // This is just a helper 
-    fn cong_push_rev(&mut self, (args1, args2): (MmbListPtr<'a>, MmbListPtr<'a>)) -> Res<()> {
-        match (args1.read(self), args2.read(self)) {
-            (Cons(h1, t1), Cons(h2, t2)) => {
-                self.cong_push_rev((t1, t2))?;
-                let cc = MmbItem::CoConv(h1, h2).alloc(self);
-                Ok(self.mem.stack.push(cc))
-            },
-            _ => {
-                make_sure!(args1.read(self) == Nil);
-                Ok(make_sure!(args2.read(self) == Nil))
-            }
-        }
-    }
-
     fn proof_unfold(&mut self) -> Res<()> {
-        let e_prime = none_err!(self.mem.stack.pop())?;
-        let f_ebar = none_err!(self.mem.stack.pop())?;
-        let (term_num, ebar) = match f_ebar.read(self) {
-            MmbItem::App{ term_num, args, .. } => (term_num, args.clone()),
-            _ => unreachable!()
+        let e_prime = none_err!(self.stack.pop())?;
+        let f_ebar = none_err!(self.stack.pop())?;
+        let (term_num, ebar) = match f_ebar {
+            MmbItem::Expr(MmbExpr::App{ term_num, args, .. }) => (term_num, args.clone()),
+            _ => return Err(VerifErr::Unreachable(file!(), line!()))
         };
 
-        let mut ebar_ = ebar;
-        make_sure!(self.mem.uheap.is_empty());
-        while let Cons(hd, tl) = ebar_.read(self) {
-            ebar_ = tl;
-            self.mem.uheap.push(hd);
-        }
+        make_sure!(self.uheap.is_empty());
+        self.uheap.extend(ebar);
 
         self.run_unify(
             crate::mmb::unify::UMode::UDef,
-            self.mem.outline.get_term_by_num(term_num)?.unify(),
+            self.outline.get_term_by_num(*term_num)?.unify(),
             e_prime,
         )?;
 
-        let cc = none_err!(self.mem.stack.pop())?;
-        if let MmbItem::CoConv(f_ebar2, e_doubleprime) = cc.read(self) {
-                make_sure!(f_ebar == f_ebar2);
-                let coconv = MmbItem::CoConv(e_prime, e_doubleprime).alloc(self);
-                Ok(self.mem.stack.push(coconv))
+        let cc = none_err!(self.stack.pop())?;
+        if let MmbItem::CoConv(f_ebar2, e_doubleprime) = cc {
+                make_sure!(f_ebar == *f_ebar2);
+                let coconv = self.alloc(MmbItem::CoConv(e_prime, e_doubleprime));
+                Ok(self.stack.push(coconv))
         } else {
-            unreachable!()
+            return Err(VerifErr::Unreachable(file!(), line!()));
         }
     }      
 
     fn proof_conv_cut(&mut self) -> Res<()> {
-        let p = none_err!(self.mem.stack.pop())?;
-        if let MmbItem::CoConv(cc1, cc2) = p.read(self) {
-            let p1 = MmbItem::Conv(cc1, cc2).alloc(self);
-            self.mem.stack.push(p1);
-            Ok(self.mem.stack.push(p))
+        let p = none_err!(self.stack.pop())?;
+        if let MmbItem::CoConv(cc1, cc2) = p {
+            let p1 = self.alloc(MmbItem::Conv(cc1, cc2));
+            self.stack.push(p1);
+            Ok(self.stack.push(p))
         } else {
-            unreachable!()
+            return Err(VerifErr::Unreachable(file!(), line!()));
         }
     }      
 
     fn proof_conv_ref(&mut self, i: u32) -> Res<()> {
-        let heap_conv = none_err!(self.mem.heap.get(i as usize).copied())?;
-        let stack_coconv = none_err!(self.mem.stack.pop())?;
-        if let (MmbItem::Conv(c1, c2), MmbItem::CoConv(cc1, cc2)) = (heap_conv.read(self), stack_coconv.read(self)) {
+        let heap_conv = none_err!(self.heap.get(i as usize).copied())?;
+        let stack_coconv = none_err!(self.stack.pop())?;
+        if let (MmbItem::Conv(c1, c2), MmbItem::CoConv(cc1, cc2)) = (heap_conv, stack_coconv) {
             make_sure!(c1 == cc1);
             Ok(make_sure!(c2 == cc2))
         } else {
-            unreachable!()
+            return Err(VerifErr::Unreachable(file!(), line!()));
         }
     }    
 
     fn proof_conv_save(&mut self) -> Res<()> {
-        let p = localize!(none_err!(self.mem.stack.pop()))?;
-        make_sure!(matches!(p.read(self), MmbItem::Conv {..}));
-        Ok(self.mem.heap.push(p))
+        let p = localize!(none_err!(self.stack.pop()))?;
+        make_sure!(matches!(p, MmbItem::Conv {..}));
+        Ok(self.heap.push(p))
     }    
 
     fn proof_save(&mut self) -> Res<()> {
-        let last = none_err!(self.mem.stack.last().copied())?;
-        match last.read(self) {
-            MmbItem::CoConv {..} => panic!("Can't save co-conv"),
-            _ => Ok(self.mem.heap.push(last))
+        let last = none_err!(self.stack.last().copied())?;
+        match last {
+            MmbItem::CoConv {..} => Err(VerifErr::Msg(format!("Can't save co-conv"))),
+            _ => Ok(self.heap.push(last))
         }        
     }    
 }

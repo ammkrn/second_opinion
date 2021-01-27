@@ -1,16 +1,19 @@
 pub mod parse;
 pub mod math_parser;
 
-use crate::none_err;
-use crate::conv_err;
 use std::convert::TryFrom;
 use std::collections::BTreeMap as Bmap;
 use std::sync::Arc;
 use std::marker::PhantomData;
+
+use bumpalo::Bump;
+use bumpalo::collections::Vec as BumpVec;
+
+use crate::none_err;
+use crate::conv_err;
 use crate::Outline;
 use crate::util::{ 
     Either::*,
-    FxIndexMap,
     FxIndexSet,
     FxMap,
     Str,
@@ -82,23 +85,17 @@ pub enum MmzItem<'a> {
     },
 }
 
-
-
 impl<'b, 'a: 'b> MmzItem<'a> {
     pub fn alloc(self, st: &mut MmzState<'b, 'a>) -> MmzPtr<'a> {
         let (idx, _) = st.mem.mmz_items.insert_full(self);
         Ptr(u32::try_from(idx).unwrap(), PhantomData)
     }
-
-    //fn read(self, _: &St<'_>) -> StoreItem { self }
 }
 
 impl<'b, 'a: 'b> MmzPtr<'a> {
     pub fn read(self, st: &MmzState<'b, 'a>) -> MmzItem<'a> {
         st.mem.mmz_items.get_index(self.0 as usize).copied().unwrap()
     }
-
-    //pub fn alloc(self, _: &mut St<'_>) -> StorePtr { self }
 }
 
 impl<'b, 'a: 'b> MmzList<'a> {
@@ -106,16 +103,12 @@ impl<'b, 'a: 'b> MmzList<'a> {
         let (idx, _) = st.mem.mmz_lists.insert_full(self);
         Ptr(u32::try_from(idx).unwrap(), PhantomData)
     }
-
-    //pub fn read(self, _: &St<'_>) -> StoreItems { self }
 }
 
 impl<'b, 'a: 'b> MmzListPtr<'a> {
     pub fn read(self, st: &MmzState<'b, 'a>) -> MmzList<'a> {
         st.mem.mmz_lists.get_index(self.0 as usize).copied().unwrap()
     }
-
-    //pub fn alloc(self, _: &mut St<'_>) -> StorePtrs { self }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -231,9 +224,9 @@ pub struct MmzMem<'a> {
     pub mmz_lists: FxIndexSet<MmzList<'a>>,
     pub delims: Vec<(u8, DelimKind)>,
 
-    pub consts: FxIndexMap<Str<'a>, Prec>,
-    pub prefixes: FxIndexMap<Str<'a>, NotationInfo<'a>>,
-    pub infixes: FxIndexMap<Str<'a>, NotationInfo<'a>>,    
+    pub consts: FxMap<Str<'a>, Prec>,
+    pub prefixes: FxMap<Str<'a>, NotationInfo<'a>>,
+    pub infixes: FxMap<Str<'a>, NotationInfo<'a>>,    
 
     // unneeded
     //pub declared_notations: FxIndexMap<Str<'a>, DeclaredNotation<'a>>,
@@ -252,14 +245,6 @@ pub struct MmzMem<'a> {
     num_asserts: u32,
     bmaps: Vec<Bmap<usize, MmzItem<'a>>>,
     vecs: Vec<Vec<MmzItem<'a>>>,
-
-    // Cleared between each declaration as the borrowing
-    // item is dropped.
-    pub vars_todo: Vec<(Str<'a>, bool)>,
-    pub vars_done: Vec<MmzVar<'a>>,
-    pub hyps: Vec<MmzHyp<'a>>,    
-    pub ustack: Vec<MmzItem<'a>>,
-    pub uheap: Vec<MmzItem<'a>>,
 }
 
 
@@ -287,9 +272,9 @@ impl<'a> MmzMem<'a> {
             mmz_lists,
             delims: Vec::new(),
 
-            consts: FxIndexMap::with_hasher(Default::default()),
-            prefixes: FxIndexMap::with_hasher(Default::default()),
-            infixes: FxIndexMap::with_hasher(Default::default()),
+            consts: FxMap::with_hasher(Default::default()),
+            prefixes: FxMap::with_hasher(Default::default()),
+            infixes: FxMap::with_hasher(Default::default()),
             //declared_notations: FxIndexMap::with_hasher(Default::default()),
 
             nonlocal_termdefs: FxMap::with_hasher(Default::default()),
@@ -303,15 +288,10 @@ impl<'a> MmzMem<'a> {
             num_asserts: 0,
             bmaps: Vec::new(),
             vecs: Vec::new(),
-            hyps: Vec::new(),
-            uheap: Vec::new(),
-            ustack: Vec::new(),
-            vars_todo: Vec::new(),
-            vars_done: Vec::new(),
         })
     }        
 
-    pub fn verify1(&mut self, stmt: StmtCmd) -> Res<()> {
+    pub fn verify1(&mut self, bump: &mut Bump, stmt: StmtCmd) -> Res<()> {
         if !stmt.is_local() {
             let item = match stmt {
                 StmtCmd::Sort {..} => None,
@@ -324,7 +304,7 @@ impl<'a> MmzMem<'a> {
                     Some(R(assert))
                 }
             };
-            self.parse_until(stmt, item)?;
+            self.parse_until(bump, stmt, item)?;
         }
         Ok(self.add_declar(stmt))
     }
@@ -397,24 +377,25 @@ impl<'a> MmzMem<'a> {
 //#[derive(Debug)]
 pub struct MmzState<'b, 'a: 'b> {
     pub mem: &'b mut MmzMem<'a>,
+    vars_todo: BumpVec<'b, (Str<'a>, bool)>,
+    vars_done: BumpVec<'b, MmzVar<'a>>,
+    hyps: BumpVec<'b, MmzHyp<'a>>,
+    ustack: BumpVec<'b, MmzItem<'a>>,
+    uheap: BumpVec<'b, MmzItem<'a>>,
     pub next_bv: u64    
 
 }
 
-impl<'b, 'a: 'b> std::ops::Drop for MmzState<'b, 'a> {
-    fn drop(&mut self) {
-        self.mem.vars_todo.clear();
-        self.mem.vars_done.clear();
-        self.mem.hyps.clear();
-        self.mem.ustack.clear();
-        self.mem.uheap.clear();
-    }
-}
-
-impl<'b, 'a: 'b> From<&'b mut MmzMem<'a>> for MmzState<'b, 'a> {
-    fn from(mem: &'b mut MmzMem<'a>) -> MmzState<'b, 'a> {
+impl<'b, 'a: 'b> MmzState<'b, 'a> {
+    pub fn new_from(mem: &'b mut MmzMem<'a>, bump: &'b mut Bump) -> MmzState<'b, 'a> {
+        bump.reset();
         MmzState {
             mem,
+            vars_todo: BumpVec::new_in(bump),
+            vars_done: BumpVec::new_in(bump),
+            hyps: BumpVec::new_in(bump),
+            ustack: BumpVec::new_in(bump),
+            uheap: BumpVec::new_in(bump),
             next_bv: 1u64            
         }
     }
@@ -433,7 +414,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     /// Produce the list of variables that have been parsed which are not dummy variables
     /// (But may be either bound or regular)
     pub fn non_dummy_vars(&self) -> impl Iterator<Item = MmzVar> {
-        self.mem.vars_done.iter().filter(|v| !v.is_dummy).copied()
+        self.vars_done.iter().filter(|v| !v.is_dummy).copied()
     }
 
     /// Produce the list of potential dependencies (bound variables that are not dummies)
@@ -443,7 +424,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     /// Produce an iterator with the same elements as what an Mmb `Args` should have ()
     pub fn args_iter(&self) -> impl Iterator<Item = MmzVar> {
-        self.mem.vars_done.iter().copied().filter(|v| !v.is_dummy)
+        self.vars_done.iter().copied().filter(|v| !v.is_dummy)
     }
 
 

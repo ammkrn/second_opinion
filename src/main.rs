@@ -16,10 +16,10 @@ mod formatting;
 mod fs;
 
 use std::path::PathBuf;
+use std::sync::atomic::{ AtomicUsize, Ordering::Relaxed };
+use bumpalo::Bump;
 use clap::{ Arg, App };
 use crossbeam_utils::thread;
-use std::sync::atomic::{ AtomicUsize, Ordering::Relaxed };
-use crate::mmb::MmbMem;
 use crate::mmz::MmzMem;
 use crate::util::VerifErr;
 use crate::fs::FileData;
@@ -105,19 +105,17 @@ fn main() {
 fn verify_serial<'a>(outline: &'a Outline<'a>) -> VerifResults<'a> {
     let task_counter = AtomicUsize::new(0);
     let (mmz_mem, mut errs) = verify_mmz(outline);
-    let (mmb_mem, mut mmb_errs) = verify_mmb(outline, &task_counter);
+    let mut mmb_errs = verify_mmb(outline, &task_counter);
     errs.append(&mut mmb_errs);
 
     VerifResults {
         mmz_mem: Some(mmz_mem),
-        mmb_mems: vec![mmb_mem],
         errs
     }
 }
 
 struct VerifResults<'a> {
     mmz_mem: Option<MmzMem<'a>>,
-    mmb_mems: Vec<MmbMem<'a>>,
     errs: Vec<VerifErr>,
 }
 
@@ -136,27 +134,24 @@ fn verify_par<'a>(outline: &'a Outline<'a>, num_threads: usize) -> VerifResults<
             Ok((mem, errs)) => (Some(mem), errs),
         };
 
-        let mut mmb_mems = Vec::new();
         for (idx, mmb_task) in mmb_tasks.into_iter().enumerate() {
             match mmb_task.join() {
                 Err(_) => { errs.push(VerifErr::Msg(format!("mmb thread {} panicked", idx))); },
-                Ok((mem, mut mmb_errs)) => {
-                    errs.append(&mut mmb_errs);
-                    mmb_mems.push(mem);
-                }
+                Ok(mut mmb_errs) => errs.append(&mut mmb_errs),
             }
         }
 
-        VerifResults { mmz_mem, mmb_mems, errs }
+        VerifResults { mmz_mem, errs }
     }).unwrap()
 }
 
 // Parsing/verifying the contents of the mmz file is done in serial
 fn verify_mmz<'a>(outline: &'a Outline<'a>) -> (MmzMem<'a>, Vec<VerifErr>) {
     let mut mem = MmzMem::new_from(outline).unwrap();
+    let mut bump = Bump::new();
     let mut errs = Vec::new();
     for (stmt, _proof) in outline.declarations.iter() {
-        if let Err(e) = mem.verify1(*stmt) {
+        if let Err(e) = mem.verify1(&mut bump, *stmt) {
             errs.push(e);
         }
     }
@@ -164,13 +159,13 @@ fn verify_mmz<'a>(outline: &'a Outline<'a>) -> (MmzMem<'a>, Vec<VerifErr>) {
     (mem, errs)
 }
 
-fn verify_mmb<'a>(outline: &'a Outline<'a>, task_counter: &AtomicUsize) -> (MmbMem<'a>, Vec<VerifErr>) {
-    let mut mmb_mem = MmbMem::new_from(outline).unwrap();
+fn verify_mmb<'a>(outline: &'a Outline<'a>, task_counter: &AtomicUsize) -> Vec<VerifErr> {
+    let mut bump = Bump::new();
     let mut errs = Vec::new();
     while let Some((stmt, proof)) = outline.declarations.get(task_counter.fetch_add(1, Relaxed)) {
-        if let Err(e) = mmb_mem.verify1(*stmt, *proof) {
+        if let Err(e) = crate::mmb::MmbState::verify1(outline, &mut bump, *stmt, *proof) {
             errs.push(e);
         }
     }
-    (mmb_mem, errs)
+    errs
 }

@@ -1,4 +1,6 @@
 use std::convert::TryFrom;
+use bumpalo::Bump;
+use bumpalo::collections::Vec as BumpVec;
 use crate::make_sure;
 use crate::Outline;
 use crate::util::{ Res, VerifErr };
@@ -8,7 +10,6 @@ use crate::util::{
     Term,
     Assert,
     Args,
-    Ptr,
     parse_u8,
     parse_u16,
     parse_u32,
@@ -22,9 +23,6 @@ pub mod proof;
 pub mod unify;
 pub mod index;
 pub mod stmt;
-
-
-use MmbList::*;
 
 const MM0B_MAGIC: u32 = 0x42304D4D;
 
@@ -56,91 +54,52 @@ pub fn sorts_compatible(from: Type, to: Type) -> bool {
   c1() || (c2() && c3())
 }
 
-pub type MmbListPtr<'a> = Ptr<'a, MmbList<'a>>;
-pub type MmbPtr<'a> = Ptr<'a, MmbItem<'a>>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MmbList<'a> {
-    Nil,
-    Cons(MmbPtr<'a>, MmbListPtr<'a>)
-}
-
-// Stack item
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MmbItem<'a> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MmbExpr<'b> {
     Var {
         idx: usize,
         ty: Type
     },
     App {
         term_num: u32,
-        args: MmbListPtr<'a>,
+        args: &'b BumpVec<'b, &'b MmbItem<'b>>,
         ty: Type,
     },
-    Proof(MmbPtr<'a>),
-    Conv(MmbPtr<'a>, MmbPtr<'a>),
-    CoConv(MmbPtr<'a>, MmbPtr<'a>)
 }
 
+// Stack item
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MmbItem<'b> {
+    Expr(&'b MmbExpr<'b>),
+    Proof(&'b MmbItem<'b>),
+    Conv(&'b MmbItem<'b>, &'b MmbItem<'b>),
+    CoConv(&'b MmbItem<'b>, &'b MmbItem<'b>)
+}
 
-impl<'b, 'a: 'b> MmbPtr<'a> {
-    pub fn get_ty(self, st: &MmbState<'b, 'a>) -> Res<Type> {
-        match self.read(st) {
-            | MmbItem::Var { ty, .. }
-            | MmbItem::App { ty, ..} => Ok(ty),
-            _ => Err(VerifErr::Msg(format!("No type!")))
+impl<'b> MmbItem<'b> {
+    pub fn get_ty(&self) -> Res<Type> {
+        match self {
+            | MmbItem::Expr(MmbExpr::Var { ty, .. })
+            | MmbItem::Expr(MmbExpr::App { ty, ..}) => Ok(*ty),
+            _ => Err(VerifErr::Msg(format!("Can't get type from a non-expr MmbItem")))
         }
     }
 
-    pub fn get_deps(self, st: &MmbState<'b, 'a>) -> Res<Type> {
-        self.get_ty(st)
+    pub fn get_deps(&self) -> Res<Type> {
+        self.get_ty()
         .and_then(|ty| ty.deps())
         .map(|deps| Type { inner: deps })
     }
 
-    pub fn get_bound_digit(self, st: &MmbState<'b, 'a>) -> Res<Type> {
-        self.get_ty(st)
+    pub fn get_bound_digit(&self) -> Res<Type> {
+        self.get_ty()
         .and_then(|ty| ty.bound_digit())
         .map(|bound_idx| Type { inner: bound_idx })
     }
 
-    pub fn low_bits(self, st: &MmbState<'b, 'a>) -> Type {
-        self.get_deps(st).or(self.get_bound_digit(st)).unwrap()
+    pub fn low_bits(&self) -> Type {
+        self.get_deps().or(self.get_bound_digit()).unwrap()
     }    
-}
-
-impl<'b, 'a: 'b> MmbItem<'a> {
-    pub fn alloc(self, st: &mut MmbState<'b, 'a>) -> MmbPtr<'a> {
-        let idx = st.mem.mmb_items.len();
-        st.mem.mmb_items.push(self);
-        Ptr(u32::try_from(idx).unwrap(), std::marker::PhantomData)
-    }
-}
-
-impl<'b, 'a: 'b> MmbPtr<'a>  {
-    pub fn read(self, st: &MmbState<'b, 'a>) -> MmbItem<'a> {
-        st.mem.mmb_items.get(self.0 as usize).copied().unwrap()
-    }
-
-    //pub fn alloc(self, _: &mut St<'_>) -> StorePtr { self }
-}
-
-impl<'b, 'a: 'b> MmbList<'a> {
-    pub fn alloc(self, st: &mut MmbState<'b, 'a>) -> MmbListPtr<'a> {
-        let idx = st.mem.mmb_lists.len();
-        st.mem.mmb_lists.push(self);
-        Ptr(u32::try_from(idx).unwrap(), std::marker::PhantomData)
-    }
-
-    //pub fn read(self, _: &St<'_>) -> StoreItems { self }
-}
-
-impl<'b, 'a: 'b> MmbListPtr<'a>  {
-    pub fn read(self, st: &MmbState<'b, 'a>) -> MmbList<'a> {
-        st.mem.mmb_lists.get(self.0 as usize).copied().unwrap()
-    }
-
-    //pub fn alloc(self, _: &mut St<'_>) -> StorePtrs { self }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -220,35 +179,35 @@ pub fn parse_header(mmb: &[u8]) -> Res<Header> {
     })
 }
 
-pub struct MmbMem<'a> {
+//#[derive(Debug)]
+pub struct MmbState<'b, 'a: 'b> {
     pub outline: &'a Outline<'a>,
-    pub mmb_items: Vec<MmbItem<'a>>,
-    pub mmb_lists: Vec<MmbList<'a>>,
+    pub bump: &'b Bump,
+    pub stack: BumpVec<'b, &'b MmbItem<'b>>,
+    pub heap: BumpVec<'b, &'b MmbItem<'b>>,
+    pub ustack: BumpVec<'b, &'b MmbItem<'b>>,
+    pub uheap: BumpVec<'b, &'b MmbItem<'b>>,
+    pub hstack: BumpVec<'b, &'b MmbItem<'b>>,     
 
-    // Cleared between each declaration as the borrowing struct gets dropped
-    pub stack: Vec<MmbPtr<'a>>,
-    pub heap: Vec<MmbPtr<'a>>,
-    pub ustack: Vec<MmbPtr<'a>>,
-    pub uheap: Vec<MmbPtr<'a>>,
-    pub hstack: Vec<MmbPtr<'a>>,     
+    pub next_bv: u64    
 }
 
-impl<'a> MmbMem<'a> {
-    pub fn new_from(outline: &'a Outline<'a>) -> Res<Self> {
-        Ok(MmbMem {
+impl<'b, 'a: 'b> MmbState<'b, 'a> {
+    pub fn new_from(outline: &'a Outline, bump: &'b mut Bump) -> MmbState<'b, 'a> {
+        bump.reset();
+        MmbState {
             outline,
-            mmb_items: Vec::new(),
-            mmb_lists: vec![Nil],
-       
-            stack: Vec::new(),
-            heap: Vec::new(),
-            uheap: Vec::new(),
-            ustack: Vec::new(),
-            hstack: Vec::new(),
-        })
+            bump: &*bump,
+            stack: BumpVec::new_in(&*bump),
+            heap: BumpVec::new_in(&*bump),
+            ustack: BumpVec::new_in(&*bump),
+            uheap: BumpVec::new_in(&*bump),
+            hstack: BumpVec::new_in(&*bump),
+            next_bv: 1u64            
+        }
     }    
 
-    pub fn verify1(&mut self, stmt: StmtCmd, proof: ProofIter<'a>) -> Res<()> {
+    pub fn verify1(outline: &'a Outline<'a>, bump: &mut Bump, stmt: StmtCmd, proof: ProofIter<'a>) -> Res<()> {
         match stmt {
             StmtCmd::Sort {..} => { 
                 if !proof.is_null() {
@@ -256,45 +215,23 @@ impl<'a> MmbMem<'a> {
                 }
             },
             StmtCmd::TermDef { num, .. } => {
-                let term = self.outline.get_term_by_num(num.unwrap())?;
+                let term = outline.get_term_by_num(num.unwrap())?;
                 if !term.is_def() && !proof.is_null() {
                     return Err(VerifErr::Msg(format!("mmb terms must have null proof iterators")));
                 }
-                MmbState::from(&mut *self).verify_termdef(stmt, term, proof)?;
+                MmbState::new_from(outline, bump).verify_termdef(stmt, term, proof)?;
             }
             StmtCmd::Axiom { num } | StmtCmd::Thm { num, .. } => {
-                let assert = self.outline.get_assert_by_num(num.unwrap())?;
-                MmbState::from(&mut *self).verify_assert(stmt, assert, proof)?;
+                let assert = outline.get_assert_by_num(num.unwrap())?;
+                MmbState::new_from(outline, bump).verify_assert(stmt, assert, proof)?;
             }            
         }
-        Ok(self.outline.add_declar(stmt))
-    }
-}
+        Ok(outline.add_declar(stmt))
+    }    
 
-//#[derive(Debug)]
-pub struct MmbState<'b, 'a: 'b> {
-    pub mem: &'b mut MmbMem<'a>,
-    pub next_bv: u64    
-}
-
-impl<'b, 'a: 'b> std::ops::Drop for MmbState<'b, 'a> {
-    fn drop(&mut self) {
-        self.mem.mmb_items.clear();
-        self.mem.mmb_lists.clear();
-        self.mem.stack.clear();
-        self.mem.heap.clear();
-        self.mem.ustack.clear();
-        self.mem.uheap.clear();
-        self.mem.hstack.clear();        
-    }
-}
-
-impl<'b, 'a: 'b> From<&'b mut MmbMem<'a>> for MmbState<'b, 'a> {
-    fn from(mem: &'b mut MmbMem<'a>) -> MmbState<'b, 'a> {
-        MmbState {
-            mem,
-            next_bv: 1u64            
-        }
+ 
+    pub fn alloc<A>(&self, item: A) -> &'b A {
+        &*self.bump.alloc(item)
     }
 }
 
@@ -308,13 +245,13 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
     }    
 
     fn load_args(&mut self, args: Args<'a>, stmt: StmtCmd) -> Res<()> {
-        make_sure!(self.mem.heap.len() == 0);
+        make_sure!(self.heap.len() == 0);
         make_sure!(self.next_bv == 1);
 
         for (idx, arg) in args.enumerate() {
             if arg.is_bound() {
                 // b/c we have a bound var, assert the arg's sort is not strict
-                make_sure!(self.mem.outline.get_sort_mods(arg.sort() as usize).unwrap().inner & SORT_STRICT == 0);
+                make_sure!(self.outline.get_sort_mods(arg.sort() as usize).unwrap().inner & SORT_STRICT == 0);
                 // increment the bv counter/checker
                 let this_bv = self.take_next_bv();
                 // assert that the mmb file has the right/sequential bv idx for this bound var
@@ -325,12 +262,11 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
                 make_sure!(0 == (arg.deps().unwrap() & !(self.next_bv - 1)));
             }
 
-            let vv = MmbItem::Var { idx, ty: arg }.alloc(self);
-            self.mem.heap.push(vv);
+            self.heap.push(self.alloc(MmbItem::Expr(self.alloc(MmbExpr::Var { idx, ty: arg }))));
         }
         // For termdefs, pop the last item (which is the return) off the stack.
         if let StmtCmd::TermDef {..} = stmt {
-            self.mem.heap.pop();
+            self.heap.pop();
         }
         Ok(())
     }       
@@ -344,13 +280,13 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         self.load_args(term.args(), stmt)?;
         if term.is_def() {
             self.run_proof(crate::mmb::proof::Mode::Def, proof)?;
-            let final_val = none_err!(self.mem.stack.pop())?;
-            let ty = final_val.get_ty(self)?;
-            make_sure!(self.mem.stack.is_empty());
+            let final_val = none_err!(self.stack.pop())?;
+            let ty = final_val.get_ty()?;
+            make_sure!(self.stack.is_empty());
             make_sure!(sorts_compatible(ty, term.ret()));
-            make_sure!(self.mem.uheap.is_empty());
-            for arg in self.mem.heap.iter().take(term.num_args_no_ret() as usize) {
-                self.mem.uheap.push(*arg);
+            make_sure!(self.uheap.is_empty());
+            for arg in self.heap.iter().take(term.num_args_no_ret() as usize) {
+                self.uheap.push(*arg);
             }
 
             self.run_unify(crate::mmb::unify::UMode::UDef, term.unify(), final_val)?;
@@ -367,18 +303,16 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         self.load_args(assert.args(), stmt)?;
         self.run_proof(crate::mmb::proof::Mode::Thm, proof)?;
 
-        let mut final_val = none_err!(self.mem.stack.pop())?;
-
-        match (final_val.read(self), stmt) {
-            (MmbItem::Proof(p), StmtCmd::Thm {..}) => final_val = p,
-            (_owise, StmtCmd::Axiom {..}) => (),
+        let final_val = match none_err!(self.stack.pop())? {
+            MmbItem::Proof(p) if matches!(stmt, StmtCmd::Thm {..}) => p,
+            owise if matches!(stmt, StmtCmd::Axiom {..}) => owise,
             owise => return Err(VerifErr::Msg(format!("Expected a proof; got {:?}", owise)))
         };
 
-        make_sure!(self.mem.stack.is_empty());
-        make_sure!(self.mem.uheap.is_empty());
-        for arg in self.mem.heap.iter().take(assert.args().len()) {
-            self.mem.uheap.push(*arg);
+        make_sure!(self.stack.is_empty());
+        make_sure!(self.uheap.is_empty());
+        for arg in self.heap.iter().take(assert.args().len()) {
+            self.uheap.push(*arg);
         }
         self.run_unify(crate::mmb::unify::UMode::UThmEnd, assert.unify(), final_val)
     }

@@ -246,10 +246,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         }
     }
 
-    fn lhs_test(
-        &mut self,
-        current_prec: Prec,
-    ) -> Option<Res<(Prec, Term<'a>)>> {
+    fn lhs_test(&mut self, current_prec: Prec) -> Option<Res<(Prec, Term<'a>)>> {
         let peeked = self.peek_math_tok()?;
         let next_prec = self.mem.consts.get(&peeked).copied()?;
 
@@ -286,7 +283,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     ) -> Res<()> {
         while let Some((p2, infix_term)) = self.lhs_test(p).transpose()? {
             let (mut rhs_e, mut rhs_s)= self.prefix(p2)?;
-            self.lhs2(lhs_e, lhs_s, &mut rhs_e, &mut rhs_s, p2, infix_term)?
+            self.lhs2((lhs_e, lhs_s), (&mut rhs_e, &mut rhs_s), p2, infix_term)?
         }
         Ok(())
     }
@@ -311,10 +308,8 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     fn lhs2(
         &mut self,
-        lhs_e: &mut MmzItem<'a>,
-        lhs_s: &mut SortNum,
-        rhs_e: &mut MmzItem<'a>,
-        rhs_s: &mut SortNum,
+        (lhs_e, lhs_s): (&mut MmzItem<'a>, &mut SortNum),
+        (rhs_e, rhs_s): (&mut MmzItem<'a>, &mut SortNum),
         p2: Prec,
         infix_term: Term<'a>,
     ) -> Res<()> {

@@ -9,7 +9,6 @@ use crate::util::{
     Assert,
     Args,
     Ptr,
-    FxIndexSet,
     parse_u8,
     parse_u16,
     parse_u32,
@@ -75,7 +74,7 @@ pub enum MmbItem<'a> {
     },
     App {
         term_num: u32,
-        args: MmbList<'a>,
+        args: MmbListPtr<'a>,
         ty: Type,
     },
     Proof(MmbPtr<'a>),
@@ -84,42 +83,43 @@ pub enum MmbItem<'a> {
 }
 
 
-impl<'b, 'a: 'b> MmbItem<'a> {
-    pub fn alloc(self, st: &mut MmbState<'b, 'a>) -> MmbPtr<'a> {
-        let (idx, _) = st.mem.mmb_items.insert_full(self);
-        Ptr(u32::try_from(idx).unwrap(), std::marker::PhantomData)
-    }
-
-    //fn read(self, _: &St<'_>) -> StoreItem { self }
-
-    pub fn get_ty(self) -> Res<Type> {
-        match self {
+impl<'b, 'a: 'b> MmbPtr<'a> {
+    pub fn get_ty(self, st: &MmbState<'b, 'a>) -> Res<Type> {
+        match self.read(st) {
             | MmbItem::Var { ty, .. }
             | MmbItem::App { ty, ..} => Ok(ty),
             _ => Err(VerifErr::Msg(format!("No type!")))
         }
     }
 
-    pub fn get_deps(self) -> Res<Type> {
-        self.get_ty()
+    pub fn get_deps(self, st: &MmbState<'b, 'a>) -> Res<Type> {
+        self.get_ty(st)
         .and_then(|ty| ty.deps())
         .map(|deps| Type { inner: deps })
     }
 
-    pub fn get_bound_digit(self) -> Res<Type> {
-        self.get_ty()
+    pub fn get_bound_digit(self, st: &MmbState<'b, 'a>) -> Res<Type> {
+        self.get_ty(st)
         .and_then(|ty| ty.bound_digit())
         .map(|bound_idx| Type { inner: bound_idx })
     }
 
-    pub fn low_bits(self) -> Type {
-        self.get_deps().or(self.get_bound_digit()).unwrap()
+    pub fn low_bits(self, st: &MmbState<'b, 'a>) -> Type {
+        self.get_deps(st).or(self.get_bound_digit(st)).unwrap()
+    }    
+}
+
+impl<'b, 'a: 'b> MmbItem<'a> {
+    pub fn alloc(self, st: &mut MmbState<'b, 'a>) -> MmbPtr<'a> {
+        let idx = st.mem.mmb_items.len();
+        st.mem.mmb_items.push(self);
+        Ptr(u32::try_from(idx).unwrap(), std::marker::PhantomData)
     }
 }
 
 impl<'b, 'a: 'b> MmbPtr<'a>  {
     pub fn read(self, st: &MmbState<'b, 'a>) -> MmbItem<'a> {
-        st.mem.mmb_items.get_index(self.0 as usize).copied().unwrap()
+        st.mem.mmb_items.get(self.0 as usize).copied().unwrap()
     }
 
     //pub fn alloc(self, _: &mut St<'_>) -> StorePtr { self }
@@ -127,7 +127,8 @@ impl<'b, 'a: 'b> MmbPtr<'a>  {
 
 impl<'b, 'a: 'b> MmbList<'a> {
     pub fn alloc(self, st: &mut MmbState<'b, 'a>) -> MmbListPtr<'a> {
-        let (idx, _) = st.mem.mmb_lists.insert_full(self);
+        let idx = st.mem.mmb_lists.len();
+        st.mem.mmb_lists.push(self);
         Ptr(u32::try_from(idx).unwrap(), std::marker::PhantomData)
     }
 
@@ -136,7 +137,7 @@ impl<'b, 'a: 'b> MmbList<'a> {
 
 impl<'b, 'a: 'b> MmbListPtr<'a>  {
     pub fn read(self, st: &MmbState<'b, 'a>) -> MmbList<'a> {
-        st.mem.mmb_lists.get_index(self.0 as usize).copied().unwrap()
+        st.mem.mmb_lists.get(self.0 as usize).copied().unwrap()
     }
 
     //pub fn alloc(self, _: &mut St<'_>) -> StorePtrs { self }
@@ -221,26 +222,23 @@ pub fn parse_header(mmb: &[u8]) -> Res<Header> {
 
 pub struct MmbMem<'a> {
     pub outline: &'a Outline<'a>,
-    pub mmb_items: FxIndexSet<MmbItem<'a>>,
-    pub mmb_lists: FxIndexSet<MmbList<'a>>,
+    pub mmb_items: Vec<MmbItem<'a>>,
+    pub mmb_lists: Vec<MmbList<'a>>,
 
     // Cleared between each declaration as the borrowing struct gets dropped
-    pub stack: Vec<MmbItem<'a>>,
-    pub heap: Vec<MmbItem<'a>>,
-    pub ustack: Vec<MmbItem<'a>>,
-    pub uheap: Vec<MmbItem<'a>>,
-    pub hstack: Vec<MmbItem<'a>>,     
+    pub stack: Vec<MmbPtr<'a>>,
+    pub heap: Vec<MmbPtr<'a>>,
+    pub ustack: Vec<MmbPtr<'a>>,
+    pub uheap: Vec<MmbPtr<'a>>,
+    pub hstack: Vec<MmbPtr<'a>>,     
 }
 
 impl<'a> MmbMem<'a> {
     pub fn new_from(outline: &'a Outline<'a>) -> Res<Self> {
-        let mut mmb_lists = FxIndexSet::with_hasher(Default::default());
-        mmb_lists.insert(Nil);
-
         Ok(MmbMem {
             outline,
-            mmb_items: FxIndexSet::with_hasher(Default::default()),
-            mmb_lists,
+            mmb_items: Vec::new(),
+            mmb_lists: vec![Nil],
        
             stack: Vec::new(),
             heap: Vec::new(),
@@ -281,6 +279,8 @@ pub struct MmbState<'b, 'a: 'b> {
 
 impl<'b, 'a: 'b> std::ops::Drop for MmbState<'b, 'a> {
     fn drop(&mut self) {
+        self.mem.mmb_items.clear();
+        self.mem.mmb_lists.clear();
         self.mem.stack.clear();
         self.mem.heap.clear();
         self.mem.ustack.clear();
@@ -306,9 +306,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         self.next_bv *= 2;
         outgoing
     }    
-}
 
-impl<'b, 'a: 'b> MmbState<'b, 'a> {
     fn load_args(&mut self, args: Args<'a>, stmt: StmtCmd) -> Res<()> {
         make_sure!(self.mem.heap.len() == 0);
         make_sure!(self.next_bv == 1);
@@ -327,7 +325,8 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
                 make_sure!(0 == (arg.deps().unwrap() & !(self.next_bv - 1)));
             }
 
-            self.mem.heap.push(MmbItem::Var { idx, ty: arg });
+            let vv = MmbItem::Var { idx, ty: arg }.alloc(self);
+            self.mem.heap.push(vv);
         }
         // For termdefs, pop the last item (which is the return) off the stack.
         if let StmtCmd::TermDef {..} = stmt {
@@ -346,7 +345,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         if term.is_def() {
             self.run_proof(crate::mmb::proof::Mode::Def, proof)?;
             let final_val = none_err!(self.mem.stack.pop())?;
-            let ty = final_val.get_ty()?;
+            let ty = final_val.get_ty(self)?;
             make_sure!(self.mem.stack.is_empty());
             make_sure!(sorts_compatible(ty, term.ret()));
             make_sure!(self.mem.uheap.is_empty());
@@ -368,9 +367,11 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         self.load_args(assert.args(), stmt)?;
         self.run_proof(crate::mmb::proof::Mode::Thm, proof)?;
 
-        let final_val = match (none_err!(self.mem.stack.pop())?, stmt) {
-            (MmbItem::Proof(p), StmtCmd::Thm {..}) => p.read(self),
-            (owise, StmtCmd::Axiom {..}) => owise,
+        let mut final_val = none_err!(self.mem.stack.pop())?;
+
+        match (final_val.read(self), stmt) {
+            (MmbItem::Proof(p), StmtCmd::Thm {..}) => final_val = p,
+            (_owise, StmtCmd::Axiom {..}) => (),
             owise => return Err(VerifErr::Msg(format!("Expected a proof; got {:?}", owise)))
         };
 
@@ -379,7 +380,6 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         for arg in self.mem.heap.iter().take(assert.args().len()) {
             self.mem.uheap.push(*arg);
         }
-
         self.run_unify(crate::mmb::unify::UMode::UThmEnd, assert.unify(), final_val)
     }
 }

@@ -1,9 +1,7 @@
-use crate::util::{
-    VerifErr,
-};
 use crate::mmb::sorts_compatible;
 use crate::mmb::unify::UMode;
 use crate::util::{ 
+    VerifErr,
     try_next_cmd,
     Res,
     Type,
@@ -11,7 +9,7 @@ use crate::util::{
 use crate::mmb::{
     MmbState,
     MmbItem,
-    MmbList,
+    MmbListPtr,
     MmbList::*,
 };
 
@@ -306,7 +304,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
 
         let ty = Type { inner: TYPE_BOUND_MASK | ((sort_num as u64) << 56) | self.take_next_bv() };
 
-        let e = MmbItem::Var { idx: self.mem.heap.len(), ty };
+        let e = MmbItem::Var { idx: self.mem.heap.len(), ty }.alloc(self);
         self.mem.stack.push(e);
         Ok(self.mem.heap.push(e))
     }        
@@ -333,7 +331,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         // Arguments from the stack (and their positions, starting from 1) that the stack demands be bound.
         let stack_bound_by_sig = all_args().filter_map(|(sig, stack)| {
             if sig.is_bound() {
-                Some(stack.get_bound_digit())
+                Some(stack.get_bound_digit(self))
             } else {
                 None
             }
@@ -342,7 +340,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
 
         // For all of the args, make sure the stack and sig items have compatible sorts.
         for (sig_arg, stack_arg) in all_args() {
-            make_sure!(sorts_compatible(stack_arg.get_ty()?, sig_arg)) 
+            make_sure!(sorts_compatible(stack_arg.get_ty(self)?, sig_arg)) 
         }
 
         // Start building the new return type now that we know we have the right sort.
@@ -350,7 +348,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
 
         // For the args not bound by the signature...
         for (sig_unbound, stack_arg) in all_args().filter(|(sig, _)| !sig.is_bound()) {
-            let mut stack_lowbits = stack_arg.get_deps().or(stack_arg.get_bound_digit())?;
+            let mut stack_lowbits = stack_arg.get_deps(self).or(stack_arg.get_bound_digit(self))?;
             if mode == Mode::Def {
                 for (idx, dep) in stack_bound_by_sig.clone().enumerate() {
                     if sig_unbound.depends_on_((idx + 1) as u64) {
@@ -372,19 +370,17 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         }        
 
         // I think this will get around it.
-        let mut stack_args_out = Nil;
+        let mut stack_args_out = Nil.alloc(self);
         for _ in 0..termref.num_args_no_ret() {
-            let elem = none_err!(self.mem.stack.pop())?;
-            let hd = elem.alloc(self);
-            let tl = stack_args_out.alloc(self);
-            stack_args_out = Cons(hd, tl);
+            let hd = none_err!(self.mem.stack.pop())?;
+            stack_args_out = Cons(hd, stack_args_out).alloc(self);
         }   
 
         let t = MmbItem::App {
             term_num,
             ty: new_type_accum,
             args: stack_args_out,
-        };
+        }.alloc(self);
 
         if save {
             self.mem.heap.push(t);
@@ -416,7 +412,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         for (idx, (_, stack_a)) in bound_by_sig.clone() {
             bound_len += 1;
             for j in 0..idx {
-                make_sure!(*&self.mem.uheap[j].get_ty().unwrap().disjoint(stack_a.low_bits()))
+                make_sure!(*&self.mem.uheap[j].get_ty(self).unwrap().disjoint(stack_a.low_bits(self)))
             }
         }
 
@@ -425,7 +421,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
             for j in 0..bound_len {
                 make_sure!(
                     !(sig_a.disjoint(Type { inner: 1 << j }))
-                    || bound_by_sig.clone().nth(j).unwrap().1.1.clone().low_bits().disjoint(stack_a.low_bits())
+                    || bound_by_sig.clone().nth(j).unwrap().1.1.clone().low_bits(self).disjoint(stack_a.low_bits(self))
                 )
             }
         }
@@ -434,7 +430,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         self.mem.stack.truncate(drain_from);
         self.run_unify(UMode::UThm, thmref.unify(), a)?;
 
-        let proof = MmbItem::Proof(a.alloc(self));
+        let proof = MmbItem::Proof(a).alloc(self);
         if save {
             self.mem.heap.push(proof);
         }
@@ -449,23 +445,23 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         make_sure!(mode != Mode::Def);
         let e = none_err!(self.mem.stack.pop())?;
         //assert that e is in a provable sort since it's a hyp
-        let e_sort_numx = e.get_ty()?.sort();
+        let e_sort_numx = e.get_ty(self)?.sort();
         let e_sort_mods = self.mem.outline.get_sort_mods(e_sort_numx as usize).unwrap().inner;
         make_sure!(e_sort_mods & crate::mmb::SORT_PROVABLE != 0);
         self.mem.hstack.push(e);
-        let proof = MmbItem::Proof(e.alloc(self));
+        let proof = MmbItem::Proof(e).alloc(self);
         Ok(self.mem.heap.push(proof))
     }      
 
 
     fn proof_conv(&mut self) -> Res<()> {
-        let e2proof = self.mem.stack.pop().unwrap();
-        let e1 = self.mem.stack.pop().unwrap();
-        match e2proof {
+        let e2proof = none_err!(self.mem.stack.pop())?;
+        let e1 = none_err!(self.mem.stack.pop())?;
+        match e2proof.read(self) {
             MmbItem::Proof(conc) => {
-                let e1proof = MmbItem::Proof(e1.alloc(self));
+                let e1proof = MmbItem::Proof(e1).alloc(self);
                 self.mem.stack.push(e1proof);
-                let coconv_e1_e2 = MmbItem::CoConv(e1.alloc(self), conc);
+                let coconv_e1_e2 = MmbItem::CoConv(e1, conc).alloc(self);
                 Ok(self.mem.stack.push(coconv_e1_e2))
             },
             _ => unreachable!()
@@ -473,7 +469,8 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
     }      
 
     fn proof_refl(&mut self) -> Res<()> {
-        if let MmbItem::CoConv(cc1, cc2) = none_err!(self.mem.stack.pop())? {
+        let e = none_err!(self.mem.stack.pop())?;
+        if let MmbItem::CoConv(cc1, cc2) = e.read(self) {
             Ok(make_sure!(cc1 == cc2))
         } else {
             unreachable!()
@@ -481,19 +478,22 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
     }      
 
     fn proof_sym(&mut self) -> Res<()> {
-        if let MmbItem::CoConv(cc1, cc2) = none_err!(self.mem.stack.pop())? {
-            Ok(self.mem.stack.push(MmbItem::CoConv(cc2, cc1)))
+        let e = none_err!(self.mem.stack.pop())?;
+        if let MmbItem::CoConv(cc1, cc2) = e.read(self) {
+            let rev = MmbItem::CoConv(cc2, cc1).alloc(self);
+            Ok(self.mem.stack.push(rev))
         } else {
             unreachable!()
         }
     }      
 
     fn proof_cong(&mut self) -> Res<()> {
-        if let MmbItem::CoConv(cc1, cc2) = none_err!(self.mem.stack.pop())? {
+        let e = none_err!(self.mem.stack.pop())?;
+        if let MmbItem::CoConv(cc1, cc2) = e.read(self)  {
             match (cc1.read(self), cc2.read(self)) {
                 (MmbItem::App { term_num: n1, args: as1, .. }, MmbItem::App { term_num: n2, args: as2, .. }) => {
                     make_sure!(n1 == n2);
-                    self.cong_push_rev(as1, as2)
+                    self.cong_push_rev((as1, as2))
                 },
                 _ => unreachable!()
             }
@@ -503,19 +503,16 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
     }      
 
     // This is just a helper 
-    fn cong_push_rev(
-        &mut self,
-        args1: MmbList<'a>,
-        args2: MmbList<'a>,
-    ) -> Res<()> {
-        match (args1, args2) {
+    fn cong_push_rev(&mut self, (args1, args2): (MmbListPtr<'a>, MmbListPtr<'a>)) -> Res<()> {
+        match (args1.read(self), args2.read(self)) {
             (Cons(h1, t1), Cons(h2, t2)) => {
-                self.cong_push_rev(t1.read(self), t2.read(self))?;
-                Ok(self.mem.stack.push(MmbItem::CoConv(h1, h2)))
+                self.cong_push_rev((t1, t2))?;
+                let cc = MmbItem::CoConv(h1, h2).alloc(self);
+                Ok(self.mem.stack.push(cc))
             },
             _ => {
-                make_sure!(args1 == Nil);
-                Ok(make_sure!(args2 == Nil))
+                make_sure!(args1.read(self) == Nil);
+                Ok(make_sure!(args2.read(self) == Nil))
             }
         }
     }
@@ -523,16 +520,16 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
     fn proof_unfold(&mut self) -> Res<()> {
         let e_prime = none_err!(self.mem.stack.pop())?;
         let f_ebar = none_err!(self.mem.stack.pop())?;
-        let (term_num, ebar) = match f_ebar {
+        let (term_num, ebar) = match f_ebar.read(self) {
             MmbItem::App{ term_num, args, .. } => (term_num, args.clone()),
             _ => unreachable!()
         };
 
         let mut ebar_ = ebar;
         make_sure!(self.mem.uheap.is_empty());
-        while let Cons(hd, tl) = ebar_ {
-            ebar_ = tl.read(self);
-            self.mem.uheap.push(hd.read(self));
+        while let Cons(hd, tl) = ebar_.read(self) {
+            ebar_ = tl;
+            self.mem.uheap.push(hd);
         }
 
         self.run_unify(
@@ -541,9 +538,10 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
             e_prime,
         )?;
 
-        if let MmbItem::CoConv(f_ebar2, e_doubleprime) = none_err!(self.mem.stack.pop())? {
-                make_sure!(f_ebar == f_ebar2.read(self));
-                let coconv = MmbItem::CoConv(e_prime.alloc(self), e_doubleprime);
+        let cc = none_err!(self.mem.stack.pop())?;
+        if let MmbItem::CoConv(f_ebar2, e_doubleprime) = cc.read(self) {
+                make_sure!(f_ebar == f_ebar2);
+                let coconv = MmbItem::CoConv(e_prime, e_doubleprime).alloc(self);
                 Ok(self.mem.stack.push(coconv))
         } else {
             unreachable!()
@@ -552,8 +550,8 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
 
     fn proof_conv_cut(&mut self) -> Res<()> {
         let p = none_err!(self.mem.stack.pop())?;
-        if let MmbItem::CoConv(cc1, cc2) = p {
-            let p1 = MmbItem::Conv(cc1, cc2);
+        if let MmbItem::CoConv(cc1, cc2) = p.read(self) {
+            let p1 = MmbItem::Conv(cc1, cc2).alloc(self);
             self.mem.stack.push(p1);
             Ok(self.mem.stack.push(p))
         } else {
@@ -564,7 +562,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
     fn proof_conv_ref(&mut self, i: u32) -> Res<()> {
         let heap_conv = none_err!(self.mem.heap.get(i as usize).copied())?;
         let stack_coconv = none_err!(self.mem.stack.pop())?;
-        if let (MmbItem::Conv(c1, c2), MmbItem::CoConv(cc1, cc2)) = (heap_conv, stack_coconv) {
+        if let (MmbItem::Conv(c1, c2), MmbItem::CoConv(cc1, cc2)) = (heap_conv.read(self), stack_coconv.read(self)) {
             make_sure!(c1 == cc1);
             Ok(make_sure!(c2 == cc2))
         } else {
@@ -574,14 +572,15 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
 
     fn proof_conv_save(&mut self) -> Res<()> {
         let p = localize!(none_err!(self.mem.stack.pop()))?;
-        make_sure!(matches!(p, MmbItem::Conv {..}));
+        make_sure!(matches!(p.read(self), MmbItem::Conv {..}));
         Ok(self.mem.heap.push(p))
     }    
 
     fn proof_save(&mut self) -> Res<()> {
-        match none_err!(self.mem.stack.last().copied())? {
+        let last = none_err!(self.mem.stack.last().copied())?;
+        match last.read(self) {
             MmbItem::CoConv {..} => panic!("Can't save co-conv"),
-            last => Ok(self.mem.heap.push(last))
+            _ => Ok(self.mem.heap.push(last))
         }        
     }    
 }

@@ -12,7 +12,7 @@ pub struct Fmtr<S, A> {
     state: S,
 }
 
-fn fmtr<S, A>(elem: A, state: S) -> Fmtr<S, A> {
+pub fn fmtr<S, A>(elem: A, state: S) -> Fmtr<S, A> {
     Fmtr {
         elem,
         state,

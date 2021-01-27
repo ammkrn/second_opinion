@@ -4,8 +4,10 @@ use crate::util::{
 };
 use crate::mmb::{
     MmbItem,
-    MmbList,
+    MmbList::*,
     MmbState,
+    MmbPtr,
+    MmbListPtr,
 };
 
 use crate::util::try_next_cmd;
@@ -150,7 +152,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         &mut self, 
         mode: UMode,
         unify: UnifyIter,
-        tgt: MmbItem<'a>,
+        tgt: MmbPtr<'a>,
     ) -> Res<()> {    
         self.mem.ustack.push(tgt);
 
@@ -180,11 +182,10 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         }
     }
 
-    pub fn push_ustack_rev_mmb(&mut self, items: MmbList<'a>) {
-        if let MmbList::Cons(hd, tl) = items {
-            self.push_ustack_rev_mmb(tl.read(self));
-            let hd_ = hd.read(self);
-            self.mem.ustack.push(hd_);
+    pub fn push_ustack_rev_mmb(&mut self, items: MmbListPtr<'a>) {
+        if let Cons(hd, tl) = items.read(self) {
+            self.push_ustack_rev_mmb(tl);
+            self.mem.ustack.push(hd);
         }
     }
 
@@ -194,7 +195,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         save: bool
     ) -> Res<()> {
         let p = none_err!(self.mem.ustack.pop())?;
-        if let MmbItem::App { term_num:id2, args, .. } = p {
+        if let MmbItem::App { term_num:id2, args, .. } = p.read(self) {
             make_sure!(term_num == id2);
             self.push_ustack_rev_mmb(args);
             if save {
@@ -213,13 +214,13 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
     ) -> Res<()> {
         make_sure!(mode == UMode::UDef);
         let p = self.mem.ustack.pop().unwrap();
-        if let MmbItem::Var { ty, .. } = p {
+        if let MmbItem::Var { ty, .. } = p.read(self) {
             make_sure!(sort_id == ty.sort());
             // assert that ty is bound, and get its bv idx (0-55);
             let bound_idx = ty.bound_digit()?;
             // ty has no dependencies
             for heap_elem in self.mem.uheap.iter() {
-                let ty = heap_elem.get_ty().unwrap();
+                let ty = heap_elem.get_ty(self).unwrap();
                 make_sure!(ty.inner & bound_idx == 0);
             }
 
@@ -231,8 +232,9 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
 
     fn unify_hyp(&mut self, mode: UMode) -> Res<()> {
         if let UMode::UThm = mode {
-            if let MmbItem::Proof(e) = none_err!(self.mem.stack.pop())? {
-                Ok(self.mem.ustack.push(e.read(self)))
+            let proof = none_err!(self.mem.stack.pop())?;
+            if let MmbItem::Proof(e) = proof.read(self) {
+                Ok(self.mem.ustack.push(e))
             } else {
                 unreachable!()
             }

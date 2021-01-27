@@ -46,12 +46,18 @@ Declarations in an mm1 file (sorts, terms, assertions) can be either local or no
 The flowchart for the verification process is as follows:
 
 0. File system stuff; open the mmb file, find the imports and open the necessary mm0 files.
-1. Parse the header of the mmb file, which makes sure you actually have an mmb file (by checking the [magic number](https://en.wikipedia.org/wiki/Magic_number_%28programming%29)). The header also contains some basic information, like the number of sorts/terms/theorems, as well as pointers to the beginning of important streams. 
+
+1. Parse the header of the mmb file, which makes sure you actually have an mmb file (by checking the [magic number](https://en.wikipedia.org/wiki/File_format#Magic_number)). The header also contains some basic information, like the number of sorts/terms/theorems, as well as pointers to the beginning of important streams. 
+
 2. Parse the mmb index, which is as the name implies; a store of auxiliary information (like declaration names)
+
 3. Guided by the header, iterate over the declarations in the mmb file (sorts, terms, assertions) and get their proofs.
+
 4. For each declaration, if it's a sort, just add it making sure it doesn't conflict or overflow. If it's a termdef or assertion, execute `run_proof` and `run_unify` using the ProofIter and UnifyIter respectively.
-5a. If the declaration is public (exists in the mm0 file), parse that declaration from the mm0 file, check it, and add it to the environment.
-5b. While parsing the mm0 file's contents, process any notation declarations, coercions, or input/output (currently unhandled) statements.
+
+5. If the declaration is public (exists in the mm0 file), parse that declaration from the mm0 file, check it, and add it to the environment.
+
+6. While parsing the mm0 file's contents, process any notation declarations, coercions, or input/output (currently unhandled) statements.
 
 Proof streams and unification streams are sequences of instructions given to the verifier by the compiled mmb file. 
 The verifier (which executes proof/unification streams) is comprised of stacks and heaps, which are just vectors from which we pop/push/read elements.
@@ -68,9 +74,11 @@ This verifier is currently capable of handling import diamonds, but import cycle
 
 
 ## Types
-Types are represented as 64 bit integers and manipulated with bit-masks and bitwise operations. This verifier puts a minimal layer of abstraction over it, but without explanation it's still fairly opaque. By `type`, we mean something to the right of the colon in a binder or return type; the information it can/may contain is a sort, whether the item is bound or free, and either the item's dependencies, or an indication of which bound variable it is (0 - 55). The high bit is always in indication of bound/not bound. It's 0 if the variable is free, and 1 if bound. The high byte's remaining 7 bits show the sort numer (0 - 127, the max number of sorts). The remaining/lower 7 bytes will either have a single `1` bit showing which bound variable it is, or it will have between 0 and 56 `1` bits which show the variable's dependencies.
+Types are represented as 64 bit integers and manipulated with bit-masks and bitwise operations. This verifier puts a minimal layer of abstraction over it, but without explanation it's still fairly opaque. By `type`, we mean something to the right of the colon in a binder or return type; the information it can/may contain is a sort, whether the item is bound or free, and either the item's dependencies, or an indication of which bound variable it is (1 - 55). The high bit is always in indication of bound/not bound. It's 0 if the variable is free, and 1 if bound. The high byte's remaining 7 bits show the sort numer (0 - 127). The remaining/lower 7 bytes will either have a single `1` bit showing which bound variable it is, or it will have between 0 and 56 `1` bits which show the variable's dependencies.
 
-* Bound variables that have dummy identifiers (like {.x : nat}) are NOT represented in the type's bits (see the third example).
+The "last" bound variable index (the 56th bit) is reserved for a future extension in which a hot 56th bit will indicate that there are additional bound variables in another location. 
+
+For bound variables that have dummy identifiers (like {.x : nat}), the bound variable is accounted for during the actual proof-checking process, and their bit comes "after" (higher in the bitfield) the other bound variables. Specifically, they're introduced as needed by `mmb::proof::proof_dummy`.
 
 In the `utils` module, `Arg` is an alias for `Type`.
 
@@ -102,11 +110,3 @@ For a variable which is:
 
 ```
 
-For this slightly modified version of `peano.mm0/sb`:
-def sb (a: nat) {.y x: nat} (p: wff x): wff =
-
-the positions of `.y` and `x` are flipped to show that dummy variables are not represented in the type's bits.
-The type of `p` is :
-p: 00000000_00000000_00000000_00000000_00000000_00000000_00000000_00000001
-
-Meaning that `p` is a regular variable, of the 0th sort (wff in this case), with a single dependency on the FIRST bound variable. Notice that even though `.y` comes before `x`, it's not considered as a potential dependency.

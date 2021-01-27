@@ -13,7 +13,7 @@ A verifier for [Metamath Zero](https://github.com/digama0/mm0) proof files.
 
 ## Use
 
-Invoke the binary, passing a relative path (like `./p_eq_np/proof.mmb`) and an optional relative path to the mm0 file that sits at the top of the import graph. If no mm0 file is passed explicitly, the verifier will look for one in the same directory as the passed mmb file. You can optionally specify the number of threads to use with the flat `-t <number>` or `--threads <number>`.
+Invoke the binary, passing a relative path (like `./p_eq_np/proof.mmb`) and an optional relative path to the mm0 file that sits at the top of the import graph. If no mm0 file is passed explicitly, the verifier will look for one in the same directory as the passed mmb file. You can optionally specify the number of threads to use with the flag `-t <number>` or `--threads <number>`.
 
 Just to clarify w.r.t. the imports:
 If we have an mm0 project `p_eq_np` in a directory which has some mm1 files, mm0 files, and some other stuff, where `a.mm1` is the top-level file, importing `b` and `c`, compiling `a.mm1` will produce a single mmb file.
@@ -30,13 +30,13 @@ If we have an mm0 project `p_eq_np` in a directory which has some mm1 files, mm0
 ```
 
 To run this verifier on your project using 4 threads, you would invoke
-`./verifier -t 4 ./a.mmb` or `./verifier -t 4 ./a.mmb ./a.mm0`.
+`./second_opinion -t 4 ./a.mmb` or `./second_opinion -t 4 ./a.mmb ./a.mm0`.
 
 ## The big picture
 
 This verifier requires two kinds of files for verification. 
 1. The mm0 file.
-The mm0 file is where metamath zero users keep a specification describing the contents of an mm1 file. You can think of this as a blueprint, or something like a header file for your mm1 file. The presence of an mm0 file in addition to the mm1 file is desirable because it allows users to ensure that the data passing through the verifier actually represents what you expect it to; that what's being proved is what you intended.
+The mm0 file is where metamath zero users keep a specification describing the contents of an mm1 file. You can think of this as a blueprint, or something like a header file for your mm1 file. The presence of an mm0 file in addition to the mm1 file is desirable because it allows users to ensure that the data passing through the verifier actually represents what you expect it to (that what's being proved is what you intended).
 
 1. The mmb file.
 The mmb file is a binary file (a big sequence of bytes) produced by a compiler for mm1. The mmb file contains information about each declaration in the mm1 file as well as the proof and unification steps that need to be checked by the verifier.
@@ -44,6 +44,7 @@ The mmb file is a binary file (a big sequence of bytes) produced by a compiler f
 Declarations in an mm1 file (sorts, terms, assertions) can be either local or non-local (public). Local declarations are those which exist only in the mm1 file, like auxiliary theorems (lemmas, but mm1 has no lemma keyword) and helper definitions. These appear in the mmb file since they need to be verified, but they do not appear in the mm0 file. The declarations that are in both the mm1 and mm0 file are public/non-local. Sorts, terms, and axioms are always public/non-local. As such, they go through an additional check in the mmz parser, which demands that the item parsed from the mm0 file unifies under the instructions given in the mmb file.
 
 The flowchart for the verification process is as follows:
+
 0. File system stuff; open the mmb file, find the imports and open the necessary mm0 files.
 1. Parse the header of the mmb file, which makes sure you actually have an mmb file (by checking the [magic number](https://en.wikipedia.org/wiki/Magic_number_%28programming%29)). The header also contains some basic information, like the number of sorts/terms/theorems, as well as pointers to the beginning of important streams. 
 2. Parse the mmb index, which is as the name implies; a store of auxiliary information (like declaration names)

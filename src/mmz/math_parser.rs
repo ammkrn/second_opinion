@@ -1,4 +1,4 @@
-use std::collections::BTreeMap as Bmap;
+use bumpalo::collections::Vec as BumpVec;
 use crate::mmz::parse::{ wc, trim };
 use crate::none_err;
 use crate::localize;
@@ -7,9 +7,7 @@ use crate::mmz::{
     MmzState,
     NotationLit,
     MathStr,
-    MathStr::*,
     MmzItem,
-    MmzList::*,
     Prec,
     DelimKind,
 };
@@ -25,26 +23,26 @@ const APP_PREC: u32 = 1024;
 
 impl<'b, 'a: 'b> MmzState<'b, 'a> {
     /// move past non-comment whitespace
-    pub fn skip_math_ws(&mut self) {
+    fn skip_math_ws(&mut self) {
         while self.cur().map(|c| wc(c)).unwrap_or(false) {
             self.advance(1);
         } 
     }
 
     /// Parse a sequence of math tokens delimited by `$` characters.
-    pub fn math_string(&mut self) -> Res<MathStr<'a>> {
+    fn math_string(&mut self) -> Res<MathStr<'b, 'a>> {
         localize!(self.guard(b'$'))?;
 
-        let mut acc = Empty;
+        let mut acc = BumpVec::new_in(self.bump);
         while let Some(tok) = self.math_tok() {
-            acc = Cont(acc.alloc(self), tok);
+            acc.push(tok);
         }
         Ok(acc)
     }    
 
     /// Try to parse a certain character, but when you skip whitespace, don't look for comments
     /// since we're working in a math string
-    pub fn guard_math(&mut self, c: u8) -> Res<u8> {
+    fn guard_math(&mut self, c: u8) -> Res<u8> {
         self.skip_math_ws();
         if self.cur() == Some(c) {
             self.advance(1);
@@ -98,9 +96,9 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         if out.is_empty() { 
             None
         } else if let [lhs @ .., b'$'] = out {
-            Some(Str::dedup(trim(lhs), self))
+            Some(Str(trim(lhs)))
         } else {
-            Some(Str::dedup(trim(out), self))
+            Some(Str(trim(out)))
         }        
     }
 
@@ -127,42 +125,21 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     /// of a single token.
     pub fn constant(&mut self) -> Res<Str<'a>> {
         let s = self.math_string()?;
-        match s {
-            Cont(pfx, sfx) if pfx.read(self) == Empty => return Ok(sfx),
-            _owise => Err(VerifErr::Msg(format!("constant can only be used for math strings comprised of 1 token")))
+        if let [tk] = s.as_slice() {
+            Ok(*tk)
+        } else {
+            Err(VerifErr::Msg(format!("constant can only be used for math strings comprised of 1 token")))
         }
     }    
  
 
-    fn literals(
-        &mut self, 
-        lits: &[NotationLit<'a>], 
-        term: Term<'a>, 
-        math_args: &mut Bmap<usize, MmzItem<'a>>
-    ) -> Res<()> {
-        for lit in lits {
-            match lit {
-                NotationLit::Const(fml) => {
-                    let tk = none_err!(self.math_tok())?;
-                    make_sure!(tk == *fml);
-                }
-                NotationLit::Var { pos, prec } => {
-                    let (e, s) = self.expr(*prec)?;
-                    let nth_arg = none_err!(term.args().nth(*pos))?;
-                    let tgt_sort = nth_arg.sort();
-                    let coerced = self.coerce(e, s, tgt_sort)?;
-                    math_args.insert(*pos, coerced);
-                }
-            }
-        }
-        Ok(())
-    }
+
 
     /// For initial calls to `expr`; expects the parser to have something 
     /// surrounded by `$` delimiters.
-    pub fn expr_(&mut self, p: Prec) -> Res<(MmzItem<'a>, SortNum)> {
+    pub fn expr_(&mut self) -> Res<(MmzItem<'b>, SortNum)> {
         localize!(self.guard(b'$'))?;
-        let (out_l, out_r) = self.expr(p)?;
+        let (out_l, out_r) = self.expr(Prec::Num(0))?;
         self.skip_math_ws();
         if let Some(b'$') = self.cur() {
             self.advance(1)
@@ -172,38 +149,24 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     }    
 
     /// For recursive calls to `expr`; doesn't demand a leading `$` token
-    pub fn expr(&mut self, p: Prec) -> Res<(MmzItem<'a>, SortNum)> {
+    fn expr(&mut self, p: Prec) -> Res<(MmzItem<'b>, SortNum)> {
         let (mut lhs, mut s) = self.prefix(p)?;
         self.lhs(p, &mut lhs, &mut s)?;
         Ok((lhs, s))
     }    
 
-    fn prefix_const(&mut self, this_prec: Prec, tok: &Str<'a>, q: Prec) -> Res<(MmzItem<'a>, SortNum)> {
-        if q >= this_prec {
-            if let Some(pfx_info) = self.mem.prefixes.get(tok).cloned() {
-                let term_num = pfx_info.term_num;
-                let term = self.mem.outline.get_term_by_num(term_num)?;
-                let mut args_bmap = self.new_bmap();
-                let _mk_base_args = self.literals(pfx_info.lits.as_ref(), term, &mut args_bmap)?;
-                let args = self.cash_in_bmap(args_bmap)?;
-                let ret = MmzItem::App {
-                    term_num,
-                    num_args: term.num_args_no_ret(),
-                    args
-                };
-                return Ok((ret, term.sort()))
-            }
-        } 
-        Err(VerifErr::Msg(format!("bad prefix const")))
-    }
-
-    fn prefix_ident(&mut self, this_prec: Prec, tok: &Str<'a>) -> Res<(MmzItem<'a>, SortNum)> {
+    fn term_app(&mut self, this_prec: Prec, tok: &Str<'a>) -> Res<(MmzItem<'b>, SortNum)> {
         let term = self.mem.get_term_by_ident(&tok)?;
         if term.num_args_no_ret() == 0 {
-            Ok((MmzItem::App { term_num: term.term_num, num_args: 0, args: Nil }, term.sort()))
+            Ok((MmzItem::App { 
+                term_num: term.term_num, 
+                num_args: 0, 
+                args: self.alloc(BumpVec::new_in(self.bump)) 
+            }, 
+            term.sort()))
         } else {
             make_sure!(this_prec <= Prec::Num(APP_PREC));
-            let mut sig_args = self.new_vec();
+            let mut sig_args = BumpVec::new_in(self.bump);
             let mut restore = self.mem.mmz_pos;
 
             for arg in term.args() {
@@ -220,14 +183,14 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                 MmzItem::App {
                     term_num: term.term_num,
                     num_args: term.num_args_no_ret(),
-                    args: self.cash_in_vec(sig_args)
+                    args: self.alloc(sig_args)
                 },
                 term.sort()
             ))
         }
     }
 
-    fn prefix(&mut self, this_prec: Prec) -> Res<(MmzItem<'a>, SortNum)> {
+    fn prefix(&mut self, this_prec: Prec) -> Res<(MmzItem<'b>, SortNum)> {
         self.skip_math_ws();
         if let Some(b'(') = self.cur() {
             self.advance(1);
@@ -242,11 +205,70 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         } else if let Some(mmz_var) = self.vars_done.iter().find(|v| v.ident == Some(tok)) {
             Ok((mmz_var.to_parse_var(), mmz_var.ty.sort()))
         } else {
-            self.prefix_ident(this_prec, &tok)
+            self.term_app(this_prec, &tok)
         }
     }
 
-    fn lhs_test(&mut self, current_prec: Prec) -> Option<Res<(Prec, Term<'a>)>> {
+    fn prefix_const(&mut self, last_prec: Prec, tok: &Str<'a>, next_prec: Prec) -> Res<(MmzItem<'b>, SortNum)> {
+        if next_prec >= last_prec {
+            if let Some(pfx_info) = self.mem.prefixes.get(tok).cloned() {
+                let term_num = pfx_info.term_num;
+                let term = self.mem.outline.get_term_by_num(term_num)?;
+                let args = self.literals(pfx_info.lits.as_ref(), term)?;
+                let ret = MmzItem::App {
+                    term_num,
+                    num_args: term.num_args_no_ret(),
+                    args: self.alloc(args)
+                };
+                return Ok((ret, term.sort()))
+            }
+        } 
+        Err(VerifErr::Msg(format!("bad prefix const")))
+    }    
+
+    fn literals(
+        &mut self, 
+        lits: &[NotationLit<'a>], 
+        term: Term<'a>, 
+    ) -> Res<BumpVec<'b, MmzItem<'b>>> {
+        let mut math_args = BumpVec::new_in(self.bump);
+        for lit in lits {
+            if let NotationLit::Var {..} = lit {
+                math_args.push(None)
+            }
+        }
+
+        for lit in lits {
+            match lit {
+                NotationLit::Const(fml) => {
+                    let tk = none_err!(self.math_tok())?;
+                    make_sure!(tk == *fml);
+                }
+                NotationLit::Var { pos, prec } => {
+                    let (e, s) = self.expr(*prec)?;
+                    let nth_arg = none_err!(term.args().nth(*pos))?;
+                    let tgt_sort = nth_arg.sort();
+                    let coerced = self.coerce(e, s, tgt_sort)?;
+                    match math_args.get_mut(*pos) {
+                        Some(x @ None) => *x = Some(coerced),
+                        _ => return Err(VerifErr::Msg(format!("misplaced variable in math_parser::literals")))
+                    }
+                }
+            }
+        }
+
+        let mut out = BumpVec::new_in(self.bump);
+        for arg in math_args {
+            match arg {
+                Some(x) => out.push(x),
+                None => return Err(VerifErr::Msg(format!("incomplete sequence of args in math_parser::literals")))
+            }
+        }
+
+        Ok(out)
+    }    
+
+    fn lhs_test(&mut self, current_prec: Prec) -> Option<Res<(Term<'a>, Prec)>> {
         let peeked = self.peek_math_tok()?;
         let next_prec = self.mem.consts.get(&peeked).copied()?;
 
@@ -259,13 +281,13 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                     .mem
                     .outline
                     .get_term_by_num(infix.term_num)
-                    .map(|t| (next_prec, t))
+                    .map(|t| (t, next_prec))
                 } else if let Prec::Num(n) = next_prec {
                     self
                     .mem
                     .outline
                     .get_term_by_num(infix.term_num)
-                    .map(|t| (Prec::Num(n + 1), t))
+                    .map(|t| (t, Prec::Num(n + 1)))
                 } else {
                     Err(VerifErr::Msg(format!("lhs_test failed")))
                 }
@@ -278,19 +300,19 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     fn lhs(
         &mut self,
         p: Prec,
-        lhs_e: &mut MmzItem<'a>,
+        lhs_e: &mut MmzItem<'b>,
         lhs_s: &mut SortNum
     ) -> Res<()> {
-        while let Some((p2, infix_term)) = self.lhs_test(p).transpose()? {
-            let (mut rhs_e, mut rhs_s)= self.prefix(p2)?;
-            self.lhs2((lhs_e, lhs_s), (&mut rhs_e, &mut rhs_s), p2, infix_term)?
+        while let Some((ge_infix_term, ge_infix_prec)) = self.lhs_test(p).transpose()? {
+            let (mut rhs_e, mut rhs_s)= self.prefix(ge_infix_prec)?;
+            self.lhs2((lhs_e, lhs_s), (ge_infix_term, ge_infix_prec), (&mut rhs_e, &mut rhs_s))?
         }
         Ok(())
     }
 
     fn check_next_prec(
         &mut self,
-        rhs_e: &mut MmzItem<'a>,
+        rhs_e: &mut MmzItem<'b>,
         rhs_s: &mut SortNum,
         current_prec: Prec,
     ) -> Option<Res<()>> {
@@ -299,7 +321,8 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         // just confirm that peeked is an infix.
         let _ = self.mem.infixes.get(&peeked)?;
         
-        if current_prec <= next_prec {
+        if next_prec >= current_prec {
+            assert!(current_prec <= next_prec);
             Some(self.lhs(next_prec, rhs_e, rhs_s))
         } else {
             None
@@ -308,12 +331,11 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     fn lhs2(
         &mut self,
-        (lhs_e, lhs_s): (&mut MmzItem<'a>, &mut SortNum),
-        (rhs_e, rhs_s): (&mut MmzItem<'a>, &mut SortNum),
-        p2: Prec,
-        infix_term: Term<'a>,
+        (lhs_e, lhs_s): (&mut MmzItem<'b>, &mut SortNum),
+        (infix_term, infix_prec): (Term<'a>, Prec),
+        (rhs_e, rhs_s): (&mut MmzItem<'b>, &mut SortNum),
     ) -> Res<()> {
-        while self.check_next_prec(rhs_e, rhs_s, p2).transpose()?.is_some() {
+        while self.check_next_prec(rhs_e, rhs_s, infix_prec).transpose()?.is_some() {
             continue
         }
 
@@ -321,15 +343,16 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         // Odd but convenient way to assert that this thing has two args + a return
         // while getting the first two args.
         if let (Some(fst), Some(snd), Some(_), None) = (args.next(), args.next(), args.next(), args.next()) {
-            let mut end_args = Nil;
-            let c1 = self.coerce(*rhs_e, *rhs_s, snd.sort())?;
-            end_args = Cons(c1.alloc(self), end_args.alloc(self));
-            let c2 = self.coerce(*lhs_e, *lhs_s, fst.sort())?;
-            end_args = Cons(c2.alloc(self), end_args.alloc(self));
+            let end_args = bumpalo::vec![
+                in self.bump;
+                self.coerce(*lhs_e, *lhs_s, fst.sort())?,
+                self.coerce(*rhs_e, *rhs_s, snd.sort())?
+            ];
+
             *lhs_e = MmzItem::App {
                 term_num: infix_term.term_num,
                 num_args: infix_term.num_args_no_ret(),
-                args: end_args
+                args: self.alloc(end_args)
             };
             Ok(*lhs_s = infix_term.sort())
         } else {

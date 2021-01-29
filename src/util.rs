@@ -1,12 +1,7 @@
-use std::hash::{ BuildHasherDefault, Hash };
 use std::convert::{ TryFrom, TryInto };
 use std::marker::PhantomData;
 use std::fmt::{ Debug, Formatter, Result as FmtResult };
-use std::collections::HashMap;
 use std::sync::atomic::{ AtomicU8, AtomicU32, Ordering::Relaxed };
-
-use indexmap::{ IndexMap, IndexSet };
-use rustc_hash::FxHasher;
 
 use crate::mmb::unify::UnifyIter;
 use crate::mmb::proof::ProofIter;
@@ -15,11 +10,6 @@ use crate::mmb::stmt::StmtCmd;
 
 /// 10000000_11111111_11111111_11111111_11111111_11111111_11111111_11111111
 const TYPE_SORT_MASK: u64 = (1 << 63) | ((1 << 56) - 1);
-
-
-pub type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
-pub type FxIndexSet<A> = IndexSet<A, BuildHasherDefault<FxHasher>>;
-pub type FxIndexMap<K, V> = IndexMap<K, V, BuildHasherDefault<FxHasher>>;
 
 
 #[macro_export]
@@ -143,21 +133,12 @@ pub struct Ptr<'a, A>(pub u32, pub PhantomData<&'a A>);
 
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Str<'a>(&'a [u8]);
+pub struct Str<'a>(pub &'a [u8]);
 
 impl<'b, 'a: 'b> Str<'a> {
-    pub fn dedup(bs: &'a [u8], st: &mut crate::mmz::MmzState<'b, 'a>) -> Self {
-        if let Some(dupe) = st.mem.strs.get(&Str(bs)) {
-            *dupe
-        } else {
-            assert!(st.mem.strs.insert(Str(bs)));
-            Str(bs)
-        }
-    }
     pub fn as_bytes(&self) -> &'a [u8] {
         self.0
     }
-
 }
 
 impl<'a> Debug for Str<'a> {
@@ -683,7 +664,6 @@ impl Mods {
     }
 }
 
-
 /// An iterator over the declaration stream. This is the main provider of 
 /// verification obligations for mmb items, giving you both the target (for example,
 /// `public term, number 13`) as well as the proof stream. The unification stream
@@ -866,6 +846,58 @@ impl<'a> Outline<'a> {
             StmtCmd::Axiom {..} | StmtCmd::Thm {..} => { self.next_assert(); },
         }        
     }
+
+    pub fn assert_mmz_done(&self, mmz: &crate::mmz::MmzMem<'a>, errs: &mut Vec<VerifErr>) {
+        if mmz.num_sorts_done() != self.header.num_sorts {
+            errs.push(VerifErr::Msg(format!(
+                "mmz verified fewer sorts than specified in the header. Verified {}, header specified {}", 
+                mmz.num_sorts_done(), 
+                self.header.num_sorts
+            )))
+        }
+
+        if mmz.num_termdefs_done() != self.header.num_terms {
+            errs.push(VerifErr::Msg(format!(
+                "mmz verified fewer terms than specified in the header. Verified {}, header specified {}", 
+                mmz.num_termdefs_done(), 
+                self.header.num_terms
+            )))
+        }
+
+        if mmz.num_asserts_done() != self.header.num_thms {
+            errs.push(VerifErr::Msg(format!(
+                "mmz verified fewer assertions than specified in the header. Verified {}, header specified {}", 
+                mmz.num_asserts_done(), 
+                self.header.num_thms
+            )))
+        }        
+    }
+
+    pub fn assert_mmb_done(&self, errs: &mut Vec<VerifErr>) {
+        if self.mmb_num_sorts_done() != self.header.num_sorts {
+            errs.push(VerifErr::Msg(format!(
+                "mmb verified fewer sorts than specified in the header. Verified {}, header specified {}", 
+                self.mmb_num_sorts_done(), 
+                self.header.num_sorts
+            )))
+        }
+
+        if self.mmb_num_termdefs_done() != self.header.num_terms {
+            errs.push(VerifErr::Msg(format!(
+                "mmb verified fewer terms than specified in the header. Verified {}, header specified {}", 
+                self.mmb_num_termdefs_done(), 
+                self.header.num_terms
+            )))
+        }
+
+        if self.mmb_num_asserts_done() != self.header.num_thms {
+            errs.push(VerifErr::Msg(format!(
+                "mmb verified fewer assertions than specified in the header. Verified {}, header specified {}", 
+                self.mmb_num_asserts_done(), 
+                self.header.num_thms
+            )))
+        }         
+    }
 }
 
 impl<'a> Outline<'a> {
@@ -949,3 +981,63 @@ impl<'a> Outline<'a> {
     }      
 }
 
+/// These are helper functions for rendering unsigned integers
+/// as a sequence of bits. For example, `view64(TYPE_SORT_MASK)` renders as:
+///
+/// 10000000_11111111_11111111_11111111_11111111_11111111_11111111_11111111
+/// 
+/// They're not efficient, but they're for debugging and I'm too lazy to write efficient
+/// ones right now.
+pub fn view64(n: u64) -> String {
+    let s = format!("{:#066b}", n);  
+    let mut acc = String::new();
+    for (idx, c) in s.chars().skip(2).enumerate() {
+        if idx % 8 == 0 && idx != 0 {
+            acc.push('_');
+        }
+        acc.push(c);
+    }
+    acc
+}
+
+pub fn view32(n: u32) -> String {
+    let s = format!("{:#034b}", n);  
+    let mut acc = String::new();
+    for (idx, c) in s.chars().skip(2).enumerate() {
+        if idx % 8 == 0 && idx != 0 {
+            acc.push('_');
+        }
+        acc.push(c);
+    }
+    acc
+}
+
+pub fn view16(n: u16) -> String {
+    let s = format!("{:#018b}", n);  
+    let mut acc = String::new();
+    for (idx, c) in s.chars().skip(2).enumerate() {
+        if idx % 8 == 0 && idx != 0 {
+            acc.push('_');
+        }
+        acc.push(c);
+    }
+    acc
+}
+
+pub fn view8(n: u8) -> String {
+    let s = format!("{:#010b}", n);  
+    let mut acc = String::new();
+    for (idx, c) in s.chars().skip(2).enumerate() {
+        if idx % 8 == 0 && idx != 0 {
+            acc.push('_');
+        }
+        acc.push(c);
+    }
+    acc
+}
+
+impl Debug for Type {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        write!(f, "{}", view64(self.inner))
+    }
+}

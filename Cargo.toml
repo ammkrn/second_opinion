@@ -14,6 +14,4 @@ overflow-checks = true
 [dependencies]
 clap = "2.33.3"
 crossbeam-utils = "0.8.1"
-indexmap = "1.6.1"
-rustc-hash = "1.1.0"
 bumpalo = { version = "3.5.0", features = ["collections"] }

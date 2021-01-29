@@ -12,7 +12,6 @@
 mod util;
 mod mmb;
 mod mmz;
-mod formatting;
 mod fs;
 
 use std::path::PathBuf;
@@ -58,9 +57,7 @@ fn main() {
         Some(s) => match s.parse::<usize>() {
             Ok(0) => 1,
             Ok(n) => n,
-            Err(_) => {
-                panic!()
-            }
+            Err(_) => panic!("The number of threads must be a natural number. got {}", s)
         }
     };
 
@@ -73,25 +70,15 @@ fn main() {
     let outline = Outline::new_from(&file_data).unwrap();
 
     // Now that all the file IO is done, we can confidently begin verification.
-    let summary = if num_threads == 1 {
+    let errs = if num_threads == 1 {
         verify_serial(&outline)
     } else {
         verify_par(&outline, num_threads)
     };
 
-    if let Some((e, es)) = summary.errs.split_first() {
+    if let Some((e, es)) = errs.split_last() {
         println!("verification was unsuccessful. Terminated with error {:?}\n + {} other errors", e, es.len());
     } else {
-        // These are "hard" assertions since the absence of errors in `summary.errs` should indicate
-        // that these are equal. If they're not, there's been a logic error somewhere.
-        // Also, we can unwrap mmz_mem since it has to be `Some` at this point.
-        assert_eq!(outline.header.num_sorts, outline.mmb_num_sorts_done());
-        assert_eq!(outline.header.num_terms, outline.mmb_num_termdefs_done());
-        assert_eq!(outline.header.num_thms, outline.mmb_num_asserts_done());
-
-        assert_eq!(outline.header.num_sorts, summary.mmz_mem.as_ref().unwrap().num_sorts_done());
-        assert_eq!(outline.header.num_terms, summary.mmz_mem.as_ref().unwrap().num_termdefs_done());
-        assert_eq!(outline.header.num_thms, summary.mmz_mem.as_ref().unwrap().num_asserts_done());
         println!(
             "\n* verified {} sorts, {} terms, and {} assertions in {}ms", 
             outline.header.num_sorts, 
@@ -102,24 +89,17 @@ fn main() {
     }
 }
 
-fn verify_serial<'a>(outline: &'a Outline<'a>) -> VerifResults<'a> {
+fn verify_serial<'a>(outline: &'a Outline<'a>) -> Vec<VerifErr> {
     let task_counter = AtomicUsize::new(0);
-    let (mmz_mem, mut errs) = verify_mmz(outline);
+    let (mut errs) = verify_mmz(outline);
     let mut mmb_errs = verify_mmb(outline, &task_counter);
     errs.append(&mut mmb_errs);
+    outline.assert_mmb_done(&mut errs);
 
-    VerifResults {
-        mmz_mem: Some(mmz_mem),
-        errs
-    }
+    errs
 }
 
-struct VerifResults<'a> {
-    mmz_mem: Option<MmzMem<'a>>,
-    errs: Vec<VerifErr>,
-}
-
-fn verify_par<'a>(outline: &'a Outline<'a>, num_threads: usize) -> VerifResults<'a> {
+fn verify_par<'a>(outline: &'a Outline<'a>, num_threads: usize) -> Vec<VerifErr> {
     let task_counter = AtomicUsize::new(0);
 
     thread::scope(|sco| {
@@ -129,9 +109,9 @@ fn verify_par<'a>(outline: &'a Outline<'a>, num_threads: usize) -> VerifResults<
             mmb_tasks.push(sco.spawn(|_| verify_mmb(outline, &task_counter)));
         }
 
-        let (mmz_mem, mut errs) = match sco.spawn(|_| verify_mmz(outline)).join() {
-            Err(_) => (None, vec![VerifErr::Msg(format!("mmz thread panicked!"))]),
-            Ok((mem, errs)) => (Some(mem), errs),
+        let mut errs = match sco.spawn(|_| verify_mmz(outline)).join() {
+            Err(_) => vec![VerifErr::Msg(format!("mmz thread panicked!"))],
+            Ok(errs) => errs,
         };
 
         for (idx, mmb_task) in mmb_tasks.into_iter().enumerate() {
@@ -141,12 +121,13 @@ fn verify_par<'a>(outline: &'a Outline<'a>, num_threads: usize) -> VerifResults<
             }
         }
 
-        VerifResults { mmz_mem, errs }
+        errs
     }).unwrap()
 }
 
+
 // Parsing/verifying the contents of the mmz file is done in serial
-fn verify_mmz<'a>(outline: &'a Outline<'a>) -> (MmzMem<'a>, Vec<VerifErr>) {
+fn verify_mmz<'a>(outline: &'a Outline<'a>) -> Vec<VerifErr> {
     let mut mem = MmzMem::new_from(outline).unwrap();
     let mut bump = Bump::new();
     let mut errs = Vec::new();
@@ -156,7 +137,8 @@ fn verify_mmz<'a>(outline: &'a Outline<'a>) -> (MmzMem<'a>, Vec<VerifErr>) {
         }
     }
 
-    (mem, errs)
+    outline.assert_mmz_done(&mem, &mut errs);
+    errs
 }
 
 fn verify_mmb<'a>(outline: &'a Outline<'a>, task_counter: &AtomicUsize) -> Vec<VerifErr> {
@@ -167,5 +149,6 @@ fn verify_mmb<'a>(outline: &'a Outline<'a>, task_counter: &AtomicUsize) -> Vec<V
             errs.push(e);
         }
     }
+
     errs
 }

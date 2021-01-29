@@ -1,12 +1,12 @@
+use std::sync::Arc;
+use std::collections::HashMap;
+use bumpalo::collections::Vec as BumpVec;
 use crate::mmb::stmt::StmtCmd;
-
 use crate::mmz::{
     MmzState,
     MmzMem,
     DelimKind, 
     MmzItem,
-    MmzList,
-    MmzList::*,
     Prec, 
     Fix, 
     NotationInfo, 
@@ -21,7 +21,6 @@ use crate::util::{
     Res, 
     VerifErr, 
     SortNum,
-    FxMap,
     Type,
     Either, 
     Term, 
@@ -32,7 +31,6 @@ use crate::util::{
 use crate::make_sure;
 use crate::localize;
 use crate::none_err;
-use std::sync::Arc;
 use crate::mmb::unify::{ UnifyCmd, UnifyIter, UMode };
 
 fn bump<'a>(yes: bool, _: Str<'a>, p: Prec) -> Prec {
@@ -187,10 +185,10 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     pub fn coerce(
         &mut self,
-        expr: MmzItem<'a>,
+        expr: MmzItem<'b>,
         sort: SortNum,
         tgt: SortNum,
-    ) -> Res<MmzItem<'a>> {
+    ) -> Res<MmzItem<'b>> {
         if sort == tgt { 
             return Ok(expr)
         }
@@ -203,11 +201,11 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         let coe = none_err!(self.mem.coes.get(&sort).and_then(|m| m.get(&tgt)).cloned())?;
         match coe {
             Coe::Single { term_num } => {
-                let args = Cons(expr.alloc(self), Nil.alloc(self));
+                //let args = Cons(expr.alloc(self), Nil.alloc(self));
                 Ok(MmzItem::App { 
                     term_num,
                     num_args: 1,
-                    args
+                    args: self.alloc(bumpalo::vec![in self.bump; expr])
                 })
             },
 
@@ -328,7 +326,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                 break
             }
         }
-        Ok(Str::dedup(&self.mem.mmz[start..self.mem.mmz_pos], self))
+        Ok(Str(&self.mem.mmz[start..self.mem.mmz_pos]))
     }
 
     fn ident(&mut self) -> Res<Str<'a>> {
@@ -361,7 +359,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                 break
             }
         }
-        Ok(Str::dedup(&self.mem.mmz[start..self.mem.mmz_pos], self))
+        Ok(Str(&self.mem.mmz[start..self.mem.mmz_pos]))
     }    
 
     pub fn parse_u32(&mut self) -> Option<u32> {
@@ -380,7 +378,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 }
 
 fn add_nota_info<'a>(
-    m: &mut FxMap<Str<'a>, NotationInfo<'a>>,
+    m: &mut HashMap<Str<'a>, NotationInfo<'a>>,
     tok: Str<'a>,
     n: NotationInfo<'a>,
 ) -> Res<()> {
@@ -463,7 +461,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         let num_args_nota = self.vars_done.len();
         assert_eq!(num_args_nota, term_num_args as usize);
 
-        let mut vars_used = Vec::new();
+        let mut vars_used = BumpVec::new_in(self.bump);
         let mut it = lits.iter().peekable();
 
         let (mut lits2, mut right_associative, tok, prec) = match it.next() {
@@ -535,7 +533,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     }
 
     fn update_provs(&mut self) -> Res<()> {
-        let mut provs = FxMap::with_hasher(Default::default());
+        let mut provs = HashMap::with_hasher(Default::default());
         for (s1, m) in self.mem.coes.iter() {
             for s2 in m.keys() {
                 if self.mem.outline.get_sort_mods(*s2 as usize)?.is_provable() {
@@ -580,7 +578,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
         let c1 = Arc::new(Coe::Single { term_num: term.term_num });
 
-        let mut todo = Vec::new();
+        let mut todo = BumpVec::new_in(self.bump);
 
         for (sl, m) in self.mem.coes.iter() {
             if let Some(c) = m.get(&from) {
@@ -817,7 +815,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
         if term.is_def() && self.peek_word() == b"=" {
             localize!(self.guard(b'='))?;
-            let (rhs_e, rhs_s) = self.expr_(Prec::Num(0))?;
+            let (rhs_e, rhs_s) = self.expr_()?;
             let rhs_e = self.coerce(rhs_e, rhs_s, self.mem.coe_prov_or_else(rhs_s))?;
             self.check_expr(term.unify(), rhs_e, UMode::UDef)?;
         }
@@ -901,8 +899,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             match var_ident.as_bytes() {
                 [b'.', tl @ ..] => {
                     make_sure!(mode == "def");
-                    let new_ident = Str::dedup(tl, self);
-                    self.vars_todo.push((new_ident, true))
+                    self.vars_todo.push((Str(tl), true))
                 },
                 _ => self.vars_todo.push((var_ident, false))
             }
@@ -952,12 +949,11 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     /// This is only used in one spot, so expects the parser to already be at the leading `$`
     fn binder_fml(&mut self, bound: bool, mode: &str) -> Res<()> {
-        self.guard(b'$')?;
+        make_sure!(mode == "assert");
         // No bound hyps
         make_sure!(!bound);
         // Has to be either an axiom or a theorem to have hyps
-        make_sure!(mode == "assert");
-        let (math_expr, math_sort) = self.expr(Prec::Num(0))?;
+        let (math_expr, math_sort) = self.expr_()?;
         let math_expr = self.coerce(math_expr, math_sort,self.mem.coe_prov_or_else(math_sort))?;
         for (ident, dummy) in self.vars_todo.iter().skip(self.vars_done.len()) {
             make_sure!(!dummy);
@@ -1005,7 +1001,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             // If it's a hypothesis
             if let Some(b'$') = { self.skip_ws(); self.cur() } {
                 make_sure!(mode == "assert"); 
-                let (math_expr, math_sort) = self.expr_(Prec::Num(0))?;
+                let (math_expr, math_sort) = self.expr_()?;
                 let math_expr = self.coerce(math_expr, math_sort,self.mem.coe_prov_or_else(math_sort))?;
                 self.hyps.push(MmzHyp { ident: None, pos: None, expr: math_expr });
             } else {
@@ -1031,18 +1027,10 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         Ok(())
     }    
 
-    pub fn push_ustack_rev_mmz(&mut self, items: MmzList<'a>) {
-        if let Cons(hd, tl) = items {
-            self.push_ustack_rev_mmz(tl.read(self));
-            let hd_ = hd.read(self);
-            self.ustack.push(hd_);
-        }
-    }
-
     pub fn check_expr(
         &mut self,
         u: UnifyIter,
-        tgt: MmzItem<'a>,
+        tgt: MmzItem<'b>,
         mode: UMode,
     ) -> Res<()> {
         self.ustack.push(tgt);
@@ -1064,7 +1052,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                     let p = none_err!(self.ustack.pop())?;
                     if let MmzItem::App { term_num:n2, args, .. } = p {
                         make_sure!(term_num == n2);
-                        self.push_ustack_rev_mmz(args);
+                        self.ustack.extend(args.into_iter().rev());
                         if save {
                             self.uheap.push(p);
                         }

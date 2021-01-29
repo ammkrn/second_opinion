@@ -2,9 +2,8 @@ pub mod parse;
 pub mod math_parser;
 
 use std::convert::TryFrom;
-use std::collections::BTreeMap as Bmap;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::marker::PhantomData;
 
 use bumpalo::Bump;
 use bumpalo::collections::Vec as BumpVec;
@@ -14,8 +13,6 @@ use crate::conv_err;
 use crate::Outline;
 use crate::util::{ 
     Either::*,
-    FxIndexSet,
-    FxMap,
     Str,
     SortNum,
     TermNum,
@@ -23,7 +20,6 @@ use crate::util::{
     SortIdent,
     TermIdent,
     AssertIdent,
-    Ptr,
     VerifErr,
     Res,
     Type,
@@ -31,48 +27,11 @@ use crate::util::{
 };
 use crate::mmb::stmt::StmtCmd;
 
-use MathStr::*;
-
-
-pub type MathStrPtr<'a> = Ptr<'a, MathStr<'a>>;
-
-// A formula is a L -> R list of Str elements
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MathStr<'a> {
-    Empty,
-    Cont(MathStrPtr<'a>, Str<'a>)
-}
-
-
-impl<'b, 'a: 'b> MathStr<'a> {
-    pub fn alloc(self, st: &mut MmzState<'b, 'a>) -> MathStrPtr<'a> {
-        let (idx, _) = st.mem.math_strs.insert_full(self);
-        Ptr(u32::try_from(idx).unwrap(), PhantomData)
-    }
-    //pub fn read(self, _: &St<'a>) -> MathStr<'a> { self }
-}
-
-impl<'b, 'a: 'b> MathStrPtr<'a> {
-    pub fn read(self, st: &MmzState<'b, 'a>) -> MathStr<'a> {
-        st.mem.math_strs.get_index(self.0 as usize).copied().unwrap()
-    }
-    //pub fn alloc(self, _: &mut St<'a>) -> MathStrPtr<'a> { self }
-}
-
-
-
-pub type MmzListPtr<'a> = Ptr<'a, MmzList<'a>>;
-pub type MmzPtr<'a> = Ptr<'a, MmzItem<'a>>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MmzList<'a> {
-    Nil,
-    Cons(MmzPtr<'a>, MmzListPtr<'a>)
-}
+pub type MathStr<'b, 'a> = BumpVec<'b, Str<'a>>;
 
 // Stack item
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MmzItem<'a> {
+pub enum MmzItem<'b> {
     Var {
         pos: usize,
         ty: Type,
@@ -81,34 +40,8 @@ pub enum MmzItem<'a> {
     App {
         term_num: u32,
         num_args: u16,
-        args: MmzList<'a>
+        args: &'b BumpVec<'b, MmzItem<'b>>
     },
-}
-
-impl<'b, 'a: 'b> MmzItem<'a> {
-    pub fn alloc(self, st: &mut MmzState<'b, 'a>) -> MmzPtr<'a> {
-        let (idx, _) = st.mem.mmz_items.insert_full(self);
-        Ptr(u32::try_from(idx).unwrap(), PhantomData)
-    }
-}
-
-impl<'b, 'a: 'b> MmzPtr<'a> {
-    pub fn read(self, st: &MmzState<'b, 'a>) -> MmzItem<'a> {
-        st.mem.mmz_items.get_index(self.0 as usize).copied().unwrap()
-    }
-}
-
-impl<'b, 'a: 'b> MmzList<'a> {
-    pub fn alloc(self, st: &mut MmzState<'b, 'a>) -> MmzListPtr<'a> {
-        let (idx, _) = st.mem.mmz_lists.insert_full(self);
-        Ptr(u32::try_from(idx).unwrap(), PhantomData)
-    }
-}
-
-impl<'b, 'a: 'b> MmzListPtr<'a> {
-    pub fn read(self, st: &MmzState<'b, 'a>) -> MmzList<'a> {
-        st.mem.mmz_lists.get_index(self.0 as usize).copied().unwrap()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -144,20 +77,20 @@ impl<'a> MmzVar<'a> {
     }
 }
 
-#[derive(Debug)]
-pub struct DeclaredNotation<'a> {
-    pub has_coe: bool,
-    pub consts: Vec<(Str<'a>, Option<Fix>)>
-}
+//#[derive(Debug)]
+//pub struct DeclaredNotation<'a> {
+//    pub has_coe: bool,
+//    pub consts: Vec<(Str<'a>, Option<Fix>)>
+//}
 
-impl<'a> std::default::Default for DeclaredNotation<'a> {
-    fn default() -> Self {
-        DeclaredNotation {
-            has_coe: false,
-            consts: Vec::new()
-        }
-    }
-}
+//impl<'a> std::default::Default for DeclaredNotation<'a> {
+//    fn default() -> Self {
+//        DeclaredNotation {
+//            has_coe: false,
+//            consts: Vec::new()
+//        }
+//    }
+//}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DelimKind {
@@ -166,12 +99,14 @@ pub enum DelimKind {
     Both,
 }
 
+/// Operator precedence for user-declared notation.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Prec {
     Num(u32),
     Max,
 }
 
+/// 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NotationInfo<'a> {
     pub term_num: u32,
@@ -187,6 +122,15 @@ pub enum Fix {
     Prefix,
 }
 
+/// Inside of a general notation declaration, you can either have variables (`Var`) or notation symbols.
+/// For example, in the notation for `peano.mm0/sb` which represents variable substitution,
+///```text
+/// notation sb (a: nat) {x: nat} (p: wff x): wff =
+/// ($[$:41) a ($/$:0) x ($]$:0) p;
+///```
+/// You have three variables [ a, x, p ]
+///
+/// and three `Const` items, [ $[$, $/$, $]$ ]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NotationLit<'a> {
     Var { pos: usize, prec: Prec },
@@ -218,35 +162,31 @@ pub struct MmzMem<'a> {
     pub mmz_files: &'a [String],
     pub mmz_file_num: usize,
     pub mmz_pos: usize,
-    pub strs: FxIndexSet<Str<'a>>,
-    pub math_strs: FxIndexSet<MathStr<'a>>,
-    pub mmz_items: FxIndexSet<MmzItem<'a>>,
-    pub mmz_lists: FxIndexSet<MmzList<'a>>,
     pub delims: Vec<(u8, DelimKind)>,
 
-    pub consts: FxMap<Str<'a>, Prec>,
-    pub prefixes: FxMap<Str<'a>, NotationInfo<'a>>,
-    pub infixes: FxMap<Str<'a>, NotationInfo<'a>>,    
+    /// Maps the string representing a user-declared notation to its associated precedence value.
+    /// `/\` |-> `Prec::Num(34)`
+    pub consts: HashMap<Str<'a>, Prec>,
+    /// A map containing prefix notations
+    pub prefixes: HashMap<Str<'a>, NotationInfo<'a>>,
+    pub infixes: HashMap<Str<'a>, NotationInfo<'a>>,    
 
     // unneeded
     //pub declared_notations: FxIndexMap<Str<'a>, DeclaredNotation<'a>>,
-    pub nonlocal_termdefs: FxMap<TermIdent<'a>, TermNum>,
-    pub nonlocal_asserts: FxMap<AssertIdent<'a>, AssertNum>,
+    pub nonlocal_termdefs: HashMap<TermIdent<'a>, TermNum>,
+    pub nonlocal_asserts: HashMap<AssertIdent<'a>, AssertNum>,
     sorts: Vec<SortIdent<'a>>,
-    pub provs: FxMap<SortNum, bool>,
+    pub provs: HashMap<SortNum, bool>,
     // sort_id, |-> [sort_id, coe]
     // A map of sort pairs `s1,s2` to the coercion `c: s1 -> s2`.
-    pub coes: FxMap<SortNum, FxMap<SortNum, Coe>>,
+    pub coes: HashMap<SortNum, HashMap<SortNum, Coe>>,
     /// A map of sorts `s` to some sort `t` such that `t` is provable and `c: s -> t` is in `coes`,
     /// if one exists.
-    pub coe_prov: FxMap<SortNum, SortNum>,
+    pub coe_prov: HashMap<SortNum, SortNum>,
     num_sorts: u8,
     num_termdefs: u32,
     num_asserts: u32,
-    bmaps: Vec<Bmap<usize, MmzItem<'a>>>,
-    vecs: Vec<Vec<MmzItem<'a>>>,
 }
-
 
 impl<'a> MmzMem<'a> {
     //fn new_for_test() -> Res<Self> {
@@ -254,11 +194,6 @@ impl<'a> MmzMem<'a> {
 
     /// The main constructor for `State`.
     pub fn new_from(outline: &'a Outline<'a>) -> Res<Self> {
-        let mut math_strs = FxIndexSet::with_hasher(Default::default());
-        let mut mmz_lists = FxIndexSet::with_hasher(Default::default());
-        math_strs.insert(Empty);
-        mmz_lists.insert(MmzList::Nil);
-
         Ok(MmzMem {
             outline,
             mmz: none_err!(outline.file_data.mmz_files.first())?.as_bytes(),
@@ -266,28 +201,22 @@ impl<'a> MmzMem<'a> {
             mmz_pos: 0usize,
             mmz_file_num: 0usize,
         
-            strs: FxIndexSet::with_hasher(Default::default()),
-            math_strs,
-            mmz_items: FxIndexSet::with_hasher(Default::default()),
-            mmz_lists,
             delims: Vec::new(),
 
-            consts: FxMap::with_hasher(Default::default()),
-            prefixes: FxMap::with_hasher(Default::default()),
-            infixes: FxMap::with_hasher(Default::default()),
+            consts: HashMap::with_hasher(Default::default()),
+            prefixes: HashMap::with_hasher(Default::default()),
+            infixes: HashMap::with_hasher(Default::default()),
             //declared_notations: FxIndexMap::with_hasher(Default::default()),
 
-            nonlocal_termdefs: FxMap::with_hasher(Default::default()),
-            nonlocal_asserts: FxMap::with_hasher(Default::default()),
+            nonlocal_termdefs: HashMap::with_hasher(Default::default()),
+            nonlocal_asserts: HashMap::with_hasher(Default::default()),
             sorts: Vec::new(),
-            provs: FxMap::with_hasher(Default::default()),
-            coes: FxMap::with_hasher(Default::default()),
-            coe_prov: FxMap::with_hasher(Default::default()),
+            provs: HashMap::with_hasher(Default::default()),
+            coes: HashMap::with_hasher(Default::default()),
+            coe_prov: HashMap::with_hasher(Default::default()),
             num_sorts: 0,
             num_termdefs: 0,
             num_asserts: 0,
-            bmaps: Vec::new(),
-            vecs: Vec::new(),
         })
     }        
 
@@ -377,11 +306,12 @@ impl<'a> MmzMem<'a> {
 //#[derive(Debug)]
 pub struct MmzState<'b, 'a: 'b> {
     pub mem: &'b mut MmzMem<'a>,
+    bump: &'b Bump,
     vars_todo: BumpVec<'b, (Str<'a>, bool)>,
-    vars_done: BumpVec<'b, MmzVar<'a>>,
-    hyps: BumpVec<'b, MmzHyp<'a>>,
-    ustack: BumpVec<'b, MmzItem<'a>>,
-    uheap: BumpVec<'b, MmzItem<'a>>,
+    vars_done: BumpVec<'b, MmzVar<'b>>,
+    hyps: BumpVec<'b, MmzHyp<'b>>,
+    ustack: BumpVec<'b, MmzItem<'b>>,
+    uheap: BumpVec<'b, MmzItem<'b>>,
     pub next_bv: u64    
 
 }
@@ -391,6 +321,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         bump.reset();
         MmzState {
             mem,
+            bump,
             vars_todo: BumpVec::new_in(bump),
             vars_done: BumpVec::new_in(bump),
             hyps: BumpVec::new_in(bump),
@@ -399,9 +330,10 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             next_bv: 1u64            
         }
     }
-}
 
-impl<'b, 'a: 'b> MmzState<'b, 'a> {
+    pub fn alloc<A>(&self, item: A) -> &'b A {
+        &*self.bump.alloc(item)
+    }        
 
     pub fn take_next_bv(&mut self) -> u64 {
         let outgoing = self.next_bv;
@@ -427,50 +359,6 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         self.vars_done.iter().copied().filter(|v| !v.is_dummy)
     }
 
-
-    pub fn new_vec(&mut self) -> Vec<MmzItem<'a>> {
-        self.mem.vecs.pop().unwrap_or_else(|| Vec::new())
-    }
-
-    /// Used for vecs of args in the math parser. When you're done with it, 
-    /// turn the args into a hash-consed list and return the empty vector to 
-    /// the pool of vecs.
-    pub fn cash_in_vec(&mut self, mut v: Vec<MmzItem<'a>>) -> MmzList<'a> {
-        let mut args = MmzList::Nil;
-        while let Some(elem) = v.pop() {
-            args = MmzList::Cons(elem.alloc(self), args.alloc(self));
-        }
-        self.mem.vecs.push(v);
-        args
-    }
-
-    pub fn new_bmap(&mut self) -> Bmap<usize, MmzItem<'a>> {
-        self.mem.bmaps.pop().unwrap_or_else(|| Bmap::new())
-    }
-
-    /// Used for the recursive parsing of arguments in the math parser. We use a bmap
-    /// instead of a list since we need to end up with a packed vec, but we may not
-    /// get the arguments sequentially, since they may be rearranged by notation.
-    ///
-    /// The convenient ways of doing this (drain/pop/etc) are for some reason
-    /// nightly-only for BTreeMap.
-    pub fn cash_in_bmap(&mut self, mut bmap: Bmap<usize, MmzItem<'a>>) -> Res<MmzList<'a>> {
-        let mut counter = bmap.len();
-        let mut args = MmzList::Nil;
-        while counter != 0 {
-            counter -= 1;
-            let hd = none_err!(bmap.get(&counter).copied())?;
-            let hd = hd.alloc(self);
-            let tl = args.alloc(self);
-            args = MmzList::Cons(hd, tl)
-        }
-        
-        bmap.clear();
-        self.mem.bmaps.push(bmap);
-        Ok(args)
-    }    
-
-
     pub fn is_empty(&self) -> bool {
         self.mem.mmz_pos == self.mem.mmz.len()
     }
@@ -487,5 +375,3 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         self.mem.mmz_pos += n;
     }    
 }
-
-

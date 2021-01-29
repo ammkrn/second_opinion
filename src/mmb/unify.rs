@@ -195,7 +195,9 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
         let p = none_err!(self.ustack.pop())?;
         if let MmbItem::Expr(MmbExpr::App { term_num:id2, args, .. }) = p {
             make_sure!(term_num == *id2);
-            self.push_ustack_rev_mmb(args);
+            for arg in args.iter().rev() {
+                self.ustack.push(arg)
+            }
             if save {
                 self.uheap.push(p)
             }

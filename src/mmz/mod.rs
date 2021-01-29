@@ -40,7 +40,7 @@ pub enum MmzItem<'b> {
     App {
         term_num: u32,
         num_args: u16,
-        args: &'b BumpVec<'b, MmzItem<'b>>
+        args: &'b [MmzItem<'b>]
     },
 }
 

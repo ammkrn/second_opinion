@@ -183,7 +183,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                 MmzItem::App {
                     term_num: term.term_num,
                     num_args: term.num_args_no_ret(),
-                    args: self.alloc(sig_args)
+                    args: self.alloc(sig_args).as_slice()
                 },
                 term.sort()
             ))

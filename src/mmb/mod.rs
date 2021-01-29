@@ -54,7 +54,7 @@ pub fn sorts_compatible(from: Type, to: Type) -> bool {
   c1() || (c2() && c3())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MmbExpr<'b> {
     Var {
         idx: usize,
@@ -62,7 +62,7 @@ pub enum MmbExpr<'b> {
     },
     App {
         term_num: u32,
-        args: &'b BumpVec<'b, &'b MmbItem<'b>>,
+        args: &'b [&'b MmbItem<'b>],
         ty: Type,
     },
 }

@@ -9,3 +9,10 @@
 + Remove MmbMem since the persistent mmb state is now just `Outline` and `Bump`
 + Consistently check for and reject duplicate precedence declarations
 + Remove a bunch of hard `unreachable!()` invocations.
+
+## 0.1.1 -> 0.1.2
+
++ Use bump allocator for MmzItem and MathStr. 
++ Remove mmz string sharing (remove indexmap and rustchash dependencies)
++ Change error reporting in main since mmz_mem is no longer `Send`.
++ style changes in math parser

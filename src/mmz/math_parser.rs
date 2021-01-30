@@ -6,6 +6,7 @@ use crate::make_sure;
 use crate::mmz::{
     MmzState,
     NotationLit,
+    NotationInfo,
     MathStr,
     MmzItem,
     Prec,
@@ -150,9 +151,8 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     /// For recursive calls to `expr`; doesn't demand a leading `$` token
     fn expr(&mut self, p: Prec) -> Res<(MmzItem<'b>, SortNum)> {
-        let (mut lhs, mut s) = self.prefix(p)?;
-        self.lhs(p, &mut lhs, &mut s)?;
-        Ok((lhs, s))
+        let (lhs_e, lhs_s) = self.prefix(p)?;
+        self.lhs(p, (lhs_e, lhs_s))
     }    
 
     fn term_app(&mut self, this_prec: Prec, tok: &Str<'a>) -> Res<(MmzItem<'b>, SortNum)> {
@@ -268,96 +268,86 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         Ok(out)
     }    
 
-    fn lhs_test(&mut self, current_prec: Prec) -> Option<Res<(Term<'a>, Prec)>> {
+    /// If the next peeked token is an *infix* operator with a precedence that is greater than or
+    /// equal to the last precedence, return (notation token, Prec, notation info)
+    fn peek_stronger_infix(&mut self, last_prec: Prec) -> Option<(Str<'a>, Prec, NotationInfo<'a>)> {
         let peeked = self.peek_math_tok()?;
         let next_prec = self.mem.consts.get(&peeked).copied()?;
-
-        if next_prec >= current_prec {
-            self.mem.infixes.get(&peeked).cloned().map(|infix| {
-                // advance past peeked token.
-                make_sure!(peeked == self.math_tok().unwrap());
-                if infix.rassoc {
-                    self
-                    .mem
-                    .outline
-                    .get_term_by_num(infix.term_num)
-                    .map(|t| (t, next_prec))
-                } else if let Prec::Num(n) = next_prec {
-                    self
-                    .mem
-                    .outline
-                    .get_term_by_num(infix.term_num)
-                    .map(|t| (t, Prec::Num(n + 1)))
-                } else {
-                    Err(VerifErr::Msg(format!("lhs_test failed")))
-                }
-            })
+        if (next_prec >= last_prec) {
+            if let Some(notation_info) = self.mem.infixes.get(&peeked).cloned() {
+                Some((peeked, next_prec, notation_info))
+            } else {
+                None
+            }
         } else {
             None
         }
-    }
+    }      
 
-    fn lhs(
-        &mut self,
-        p: Prec,
-        lhs_e: &mut MmzItem<'b>,
-        lhs_s: &mut SortNum
-    ) -> Res<()> {
-        while let Some((ge_infix_term, ge_infix_prec)) = self.lhs_test(p).transpose()? {
-            let (mut rhs_e, mut rhs_s)= self.prefix(ge_infix_prec)?;
-            self.lhs2((lhs_e, lhs_s), (ge_infix_term, ge_infix_prec), (&mut rhs_e, &mut rhs_s))?
-        }
-        Ok(())
-    }
+    /// If the next token is an infix operator with precedence >= the last
+    /// precedence, return the term it represents, and its precedence, bumping the precedence
+    /// by 1 if it's left-associative so that the `>=` test will fail if the next operator
+    /// is the same.
+    /// 
+    /// DOES advance the parser.
+    fn take_ge_infix(&mut self, last_prec: Prec) -> Option<Res<(Term<'a>, Prec)>> {
+        let (_, next_prec, notation_info) = self.peek_stronger_infix(last_prec)?;
+        let infix_term = self.mem.outline.get_term_by_num(notation_info.term_num);
+        self.math_tok().unwrap();
+        Some(
+            if notation_info.rassoc {
+                infix_term.map(|t| (t, next_prec))
+            } else if let Prec::Num(n) = next_prec {
+                infix_term.map(|t| (t, Prec::Num(n + 1)))
+            } else {
+                Err(VerifErr::Msg(format!("bad lhs")))
+            }
+        )
+    }    
 
-    fn check_next_prec(
-        &mut self,
-        rhs_e: &mut MmzItem<'b>,
-        rhs_s: &mut SortNum,
-        current_prec: Prec,
-    ) -> Option<Res<()>> {
-        let peeked = self.peek_math_tok()?;
-        let next_prec = self.mem.consts.get(&peeked).copied()?;
-        // just confirm that peeked is an infix.
-        let _ = self.mem.infixes.get(&peeked)?;
-        
-        if next_prec >= current_prec {
-            assert!(current_prec <= next_prec);
-            Some(self.lhs(next_prec, rhs_e, rhs_s))
+    /// lhs and lhs2 are mutually recursive functions that form the part of the pratt parser
+    /// that deals with the presence of infix tokens.
+    fn lhs(&mut self, p: Prec, (lhs_e, lhs_s): (MmzItem<'b>, SortNum)) -> Res<(MmzItem<'b>, SortNum)> {
+        // If the next token is a >= infix notation...
+        if let Some((ge_infix_term, ge_infix_prec)) = self.take_ge_infix(p).transpose()? {
+            let (rhs_e, rhs_s) = self.prefix(ge_infix_prec)?;
+            let (new_lhs_e, new_lhs_s) = self.lhs2((lhs_e, lhs_s), (ge_infix_term, ge_infix_prec), (rhs_e, rhs_s))?;
+            self.lhs(p, (new_lhs_e, new_lhs_s))
         } else {
-            None
+        // If no ge_infix_term, recursion stops; give back args
+            Ok((lhs_e, lhs_s))
         }
     }
 
     fn lhs2(
         &mut self,
-        (lhs_e, lhs_s): (&mut MmzItem<'b>, &mut SortNum),
+        (lhs_e, lhs_s): (MmzItem<'b>, SortNum),
         (infix_term, infix_prec): (Term<'a>, Prec),
-        (rhs_e, rhs_s): (&mut MmzItem<'b>, &mut SortNum),
-    ) -> Res<()> {
-        while self.check_next_prec(rhs_e, rhs_s, infix_prec).transpose()?.is_some() {
-            continue
-        }
-
-        let mut args = infix_term.args();
-        // Odd but convenient way to assert that this thing has two args + a return
-        // while getting the first two args.
-        if let (Some(fst), Some(snd), Some(_), None) = (args.next(), args.next(), args.next(), args.next()) {
-            let end_args = bumpalo::vec![
-                in self.bump;
-                self.coerce(*lhs_e, *lhs_s, fst.sort())?,
-                self.coerce(*rhs_e, *rhs_s, snd.sort())?
-            ];
-
-            *lhs_e = MmzItem::App {
-                term_num: infix_term.term_num,
-                num_args: infix_term.num_args_no_ret(),
-                args: self.alloc(end_args)
-            };
-            Ok(*lhs_s = infix_term.sort())
+        (rhs_e, rhs_s): (MmzItem<'b>, SortNum),
+    ) -> Res<(MmzItem<'b>, SortNum)> {
+        if let Some((_, next_prec, _)) = self.peek_stronger_infix(infix_prec) {
+            let (new_rhs_e, new_rhs_s) = self.lhs(next_prec, (rhs_e, rhs_s))?;
+            self.lhs2((lhs_e, lhs_s), (infix_term, infix_prec), (new_rhs_e, new_rhs_s))
         } else {
-            panic!()
+            let mut args = infix_term.args();
+            if let (Some(fst), Some(snd), Some(_), None) = (args.next(), args.next(), args.next(), args.next()) {
+                let end_args = bumpalo::vec![
+                    in self.bump;
+                    self.coerce(lhs_e, lhs_s, fst.sort())?,
+                    self.coerce(rhs_e, rhs_s, snd.sort())?
+                ];
+
+                let new_lhs_e = MmzItem::App {
+                    term_num: infix_term.term_num,
+                    num_args: infix_term.num_args_no_ret(),
+                    args: self.alloc(end_args)
+                };
+                let new_lhs_s = infix_term.sort();
+                Ok((new_lhs_e, new_lhs_s))
+            } else {
+                panic!()
+            }
         }
-    }
+    }   
 }
 

@@ -31,7 +31,7 @@ pub type MathStr<'b, 'a> = BumpVec<'b, Str<'a>>;
 
 // Stack item
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MmzItem<'b> {
+pub enum MmzExpr<'b> {
     Var {
         pos: usize,
         ty: Type,
@@ -40,7 +40,7 @@ pub enum MmzItem<'b> {
     App {
         term_num: u32,
         num_args: u16,
-        args: &'b [MmzItem<'b>]
+        args: &'b [MmzExpr<'b>]
     },
 }
 
@@ -48,7 +48,7 @@ pub enum MmzItem<'b> {
 pub struct MmzHyp<'a> {
     pub ident: Option<Str<'a>>,
     pub pos: Option<usize>,
-    pub expr: MmzItem<'a>,
+    pub expr: MmzExpr<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,8 +60,8 @@ pub struct MmzVar<'a> {
 }
 
 impl<'a> MmzVar<'a> {
-    pub fn to_parse_var(self) -> MmzItem<'a> {
-        MmzItem::Var {
+    pub fn to_parse_var(self) -> MmzExpr<'a> {
+        MmzExpr::Var {
             pos: self.pos,
             ty: self.ty,
             is_dummy: self.is_dummy
@@ -310,8 +310,8 @@ pub struct MmzState<'b, 'a: 'b> {
     vars_todo: BumpVec<'b, (Str<'a>, bool)>,
     vars_done: BumpVec<'b, MmzVar<'b>>,
     hyps: BumpVec<'b, MmzHyp<'b>>,
-    ustack: BumpVec<'b, MmzItem<'b>>,
-    uheap: BumpVec<'b, MmzItem<'b>>,
+    ustack: BumpVec<'b, MmzExpr<'b>>,
+    uheap: BumpVec<'b, MmzExpr<'b>>,
     pub next_bv: u64    
 
 }

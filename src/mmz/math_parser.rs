@@ -8,7 +8,7 @@ use crate::mmz::{
     NotationLit,
     NotationInfo,
     MathStr,
-    MmzItem,
+    MmzExpr,
     Prec,
     DelimKind,
 };
@@ -138,7 +138,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     /// For initial calls to `expr`; expects the parser to have something 
     /// surrounded by `$` delimiters.
-    pub fn expr_(&mut self) -> Res<(MmzItem<'b>, SortNum)> {
+    pub fn expr_(&mut self) -> Res<(MmzExpr<'b>, SortNum)> {
         localize!(self.guard(b'$'))?;
         let (out_l, out_r) = self.expr(Prec::Num(0))?;
         self.skip_math_ws();
@@ -150,15 +150,15 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     }    
 
     /// For recursive calls to `expr`; doesn't demand a leading `$` token
-    fn expr(&mut self, p: Prec) -> Res<(MmzItem<'b>, SortNum)> {
+    fn expr(&mut self, p: Prec) -> Res<(MmzExpr<'b>, SortNum)> {
         let (lhs_e, lhs_s) = self.prefix(p)?;
         self.lhs(p, (lhs_e, lhs_s))
     }    
 
-    fn term_app(&mut self, this_prec: Prec, tok: &Str<'a>) -> Res<(MmzItem<'b>, SortNum)> {
+    fn term_app(&mut self, this_prec: Prec, tok: &Str<'a>) -> Res<(MmzExpr<'b>, SortNum)> {
         let term = self.mem.get_term_by_ident(&tok)?;
         if term.num_args_no_ret() == 0 {
-            Ok((MmzItem::App { 
+            Ok((MmzExpr::App { 
                 term_num: term.term_num, 
                 num_args: 0, 
                 args: self.alloc(BumpVec::new_in(self.bump)) 
@@ -180,7 +180,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             }
 
             Ok((
-                MmzItem::App {
+                MmzExpr::App {
                     term_num: term.term_num,
                     num_args: term.num_args_no_ret(),
                     args: self.alloc(sig_args).as_slice()
@@ -190,7 +190,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         }
     }
 
-    fn prefix(&mut self, this_prec: Prec) -> Res<(MmzItem<'b>, SortNum)> {
+    fn prefix(&mut self, this_prec: Prec) -> Res<(MmzExpr<'b>, SortNum)> {
         self.skip_math_ws();
         if let Some(b'(') = self.cur() {
             self.advance(1);
@@ -209,13 +209,13 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         }
     }
 
-    fn prefix_const(&mut self, last_prec: Prec, tok: &Str<'a>, next_prec: Prec) -> Res<(MmzItem<'b>, SortNum)> {
+    fn prefix_const(&mut self, last_prec: Prec, tok: &Str<'a>, next_prec: Prec) -> Res<(MmzExpr<'b>, SortNum)> {
         if next_prec >= last_prec {
             if let Some(pfx_info) = self.mem.prefixes.get(tok).cloned() {
                 let term_num = pfx_info.term_num;
                 let term = self.mem.outline.get_term_by_num(term_num)?;
                 let args = self.literals(pfx_info.lits.as_ref(), term)?;
-                let ret = MmzItem::App {
+                let ret = MmzExpr::App {
                     term_num,
                     num_args: term.num_args_no_ret(),
                     args: self.alloc(args)
@@ -230,7 +230,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         &mut self, 
         lits: &[NotationLit<'a>], 
         term: Term<'a>, 
-    ) -> Res<BumpVec<'b, MmzItem<'b>>> {
+    ) -> Res<BumpVec<'b, MmzExpr<'b>>> {
         let mut math_args = BumpVec::new_in(self.bump);
         for lit in lits {
             if let NotationLit::Var {..} = lit {
@@ -307,7 +307,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     /// lhs and lhs2 are mutually recursive functions that form the part of the pratt parser
     /// that deals with the presence of infix tokens.
-    fn lhs(&mut self, p: Prec, (lhs_e, lhs_s): (MmzItem<'b>, SortNum)) -> Res<(MmzItem<'b>, SortNum)> {
+    fn lhs(&mut self, p: Prec, (lhs_e, lhs_s): (MmzExpr<'b>, SortNum)) -> Res<(MmzExpr<'b>, SortNum)> {
         // If the next token is a >= infix notation...
         if let Some((ge_infix_term, ge_infix_prec)) = self.take_ge_infix(p).transpose()? {
             let (rhs_e, rhs_s) = self.prefix(ge_infix_prec)?;
@@ -321,10 +321,10 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     fn lhs2(
         &mut self,
-        (lhs_e, lhs_s): (MmzItem<'b>, SortNum),
+        (lhs_e, lhs_s): (MmzExpr<'b>, SortNum),
         (infix_term, infix_prec): (Term<'a>, Prec),
-        (rhs_e, rhs_s): (MmzItem<'b>, SortNum),
-    ) -> Res<(MmzItem<'b>, SortNum)> {
+        (rhs_e, rhs_s): (MmzExpr<'b>, SortNum),
+    ) -> Res<(MmzExpr<'b>, SortNum)> {
         if let Some((_, next_prec, _)) = self.peek_stronger_infix(infix_prec) {
             let (new_rhs_e, new_rhs_s) = self.lhs(next_prec, (rhs_e, rhs_s))?;
             self.lhs2((lhs_e, lhs_s), (infix_term, infix_prec), (new_rhs_e, new_rhs_s))
@@ -337,7 +337,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                     self.coerce(rhs_e, rhs_s, snd.sort())?
                 ];
 
-                let new_lhs_e = MmzItem::App {
+                let new_lhs_e = MmzExpr::App {
                     term_num: infix_term.term_num,
                     num_args: infix_term.num_args_no_ret(),
                     args: self.alloc(end_args)

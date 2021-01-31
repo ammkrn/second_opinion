@@ -6,7 +6,7 @@ use crate::mmz::{
     MmzState,
     MmzMem,
     DelimKind, 
-    MmzItem,
+    MmzExpr,
     Prec, 
     Fix, 
     NotationInfo, 
@@ -185,10 +185,10 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     pub fn coerce(
         &mut self,
-        expr: MmzItem<'b>,
+        expr: MmzExpr<'b>,
         sort: SortNum,
         tgt: SortNum,
-    ) -> Res<MmzItem<'b>> {
+    ) -> Res<MmzExpr<'b>> {
         if sort == tgt { 
             return Ok(expr)
         }
@@ -202,7 +202,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         match coe {
             Coe::Single { term_num } => {
                 //let args = Cons(expr.alloc(self), Nil.alloc(self));
-                Ok(MmzItem::App { 
+                Ok(MmzExpr::App { 
                     term_num,
                     num_args: 1,
                     args: self.alloc(bumpalo::vec![in self.bump; expr])
@@ -1030,7 +1030,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     pub fn check_expr(
         &mut self,
         u: UnifyIter,
-        tgt: MmzItem<'b>,
+        tgt: MmzExpr<'b>,
         mode: UMode,
     ) -> Res<()> {
         self.ustack.push(tgt);
@@ -1050,7 +1050,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                 }
                 UnifyCmd::Term { term_num, save } => {
                     let p = none_err!(self.ustack.pop())?;
-                    if let MmzItem::App { term_num:n2, args, .. } = p {
+                    if let MmzExpr::App { term_num:n2, args, .. } = p {
                         make_sure!(term_num == n2);
                         self.ustack.extend(args.into_iter().rev());
                         if save {
@@ -1063,7 +1063,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                 UnifyCmd::Dummy { sort_id } => {
                     make_sure!(mode == UMode::UDef);
                     let p = none_err!(self.ustack.pop())?;
-                    if let MmzItem::Var { ty, is_dummy, .. } = p {
+                    if let MmzExpr::Var { ty, is_dummy, .. } = p {
                         make_sure!(sort_id == ty.sort());
                         make_sure!(is_dummy);
                         self.uheap.push(p)

@@ -32,16 +32,22 @@ pub type MathStr<'b, 'a> = BumpVec<'b, Str<'a>>;
 // Stack item
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MmzExpr<'b> {
-    Var {
-        pos: usize,
-        ty: Type,
-        is_dummy: bool
-    },
+    Var(MmzVar<'b>),
     App {
         term_num: u32,
         num_args: u16,
-        args: &'b [MmzExpr<'b>]
+        args: &'b [MmzExpr<'b>],
+        sort: SortNum,
     },
+}
+
+impl<'b> MmzExpr<'b> {
+    fn sort(self) -> SortNum {
+        match self {
+            MmzExpr::Var(v) => v.sort(),
+            MmzExpr::App { sort, .. } => sort
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,14 +66,6 @@ pub struct MmzVar<'a> {
 }
 
 impl<'a> MmzVar<'a> {
-    pub fn to_parse_var(self) -> MmzExpr<'a> {
-        MmzExpr::Var {
-            pos: self.pos,
-            ty: self.ty,
-            is_dummy: self.is_dummy
-        }
-    }
-    
     pub fn is_bound(self) -> bool {
         self.ty.is_bound()
     }
@@ -142,15 +140,17 @@ pub enum NotationLit<'a> {
 pub enum Coe {
     // term_id
     Single {
-        term_num: u32,
+        term_num: TermNum,
     },
     // transitive
     // `Trans(c1, m, c2)` asserts that `c1: s1 -> m` and `c2: m -> s2` (so we get a transitive
     // coercion from `s1` to `s2`).
-    // middle is a sort_id
     Trans {
+        // (sA -> sB)
         c1: Arc<Coe>,
-        sort_num: u8,
+        // sB
+        middleman_sort: SortNum,
+        // (sB -> sC)
         c2: Arc<Coe>
     },
 }
@@ -170,15 +170,15 @@ pub struct MmzMem<'a> {
     /// A map containing prefix notations
     pub prefixes: HashMap<Str<'a>, NotationInfo<'a>>,
     pub infixes: HashMap<Str<'a>, NotationInfo<'a>>,    
-
     // unneeded
     //pub declared_notations: FxIndexMap<Str<'a>, DeclaredNotation<'a>>,
     pub nonlocal_termdefs: HashMap<TermIdent<'a>, TermNum>,
     pub nonlocal_asserts: HashMap<AssertIdent<'a>, AssertNum>,
     sorts: Vec<SortIdent<'a>>,
     pub provs: HashMap<SortNum, bool>,
-    // sort_id, |-> [sort_id, coe]
-    // A map of sort pairs `s1,s2` to the coercion `c: s1 -> s2`.
+    /// `sort_id |-> [sort_id |-> coe]`
+    ///
+    /// A map of sort pairs `s1/from, s2/to` to the coercion `c: s1 -> s2`.
     pub coes: HashMap<SortNum, HashMap<SortNum, Coe>>,
     /// A map of sorts `s` to some sort `t` such that `t` is provable and `c: s -> t` is in `coes`,
     /// if one exists.
@@ -203,17 +203,16 @@ impl<'a> MmzMem<'a> {
         
             delims: Vec::new(),
 
-            consts: HashMap::with_hasher(Default::default()),
-            prefixes: HashMap::with_hasher(Default::default()),
-            infixes: HashMap::with_hasher(Default::default()),
+            consts: HashMap::new(),
+            prefixes: HashMap::new(),
+            infixes: HashMap::new(),
             //declared_notations: FxIndexMap::with_hasher(Default::default()),
-
-            nonlocal_termdefs: HashMap::with_hasher(Default::default()),
-            nonlocal_asserts: HashMap::with_hasher(Default::default()),
+            nonlocal_termdefs: HashMap::new(),
+            nonlocal_asserts: HashMap::new(),
             sorts: Vec::new(),
-            provs: HashMap::with_hasher(Default::default()),
-            coes: HashMap::with_hasher(Default::default()),
-            coe_prov: HashMap::with_hasher(Default::default()),
+            provs: HashMap::new(),
+            coes: HashMap::new(),
+            coe_prov: HashMap::new(),
             num_sorts: 0,
             num_termdefs: 0,
             num_asserts: 0,
@@ -250,13 +249,13 @@ impl<'a> MmzMem<'a> {
     }
 
 
-    pub fn add_termdef(&mut self, ident: Str<'a>) -> u32 {
+    pub fn add_termdef(&mut self, ident: Str<'a>) -> TermNum {
         let idx = self.num_termdefs;
         assert!(self.nonlocal_termdefs.insert(ident, idx).is_none());
         idx
     }
 
-    pub fn add_assert(&mut self, ident: Str<'a>) -> u32 {
+    pub fn add_assert(&mut self, ident: Str<'a>) -> AssertNum {
         let idx = self.num_asserts;
         assert!(self.nonlocal_asserts.insert(ident, idx).is_none());
 
@@ -268,7 +267,7 @@ impl<'a> MmzMem<'a> {
         conv_err!(u8::try_from(idx))
     }
 
-    pub fn add_sort(&mut self, ident: Str<'a>) -> u8 {
+    pub fn add_sort(&mut self, ident: Str<'a>) -> SortNum {
         let idx = self.sorts.len();
         assert!(!self.sorts.iter().any(|x| *x == ident));
         self.sorts.push(ident);

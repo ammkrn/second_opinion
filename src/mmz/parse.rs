@@ -183,38 +183,41 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         }
     }
 
-    pub fn coerce(
-        &mut self,
-        expr: MmzExpr<'b>,
-        sort: SortNum,
-        tgt: SortNum,
-    ) -> Res<MmzExpr<'b>> {
-        if sort == tgt { 
-            return Ok(expr)
+    /// Given an expression `(e: x)` and a target sort `z`, try to coerce an expression `(e: z)`
+    pub fn coerce(&mut self, e_x: MmzExpr<'b>, z: SortNum) -> Res<MmzExpr<'b>> {
+        // If the task is coercion of `(e: z)` to `(e: z)`, just return `e`.
+        if e_x.sort() == z { 
+            return Ok(e_x)
         }
 
-        if let Some(tgt_id) = self.mem.coe_prov.get(&sort) {
-            if tgt == *tgt_id {
-                return Ok(expr)
+        // If the coercion `x > z` exists, but `z` is provable, return `(e: x)`
+        if let Some(tgt_id) = self.mem.coe_prov.get(&e_x.sort()) {
+            if z == *tgt_id {
+                return Ok(e_x)
             }
         }
-        let coe = none_err!(self.mem.coes.get(&sort).and_then(|m| m.get(&tgt)).cloned())?;
+
+        // Find the existing coercion `x > z`
+        let coe = none_err!(self.mem.coes.get(&e_x.sort()).and_then(|m| m.get(&z)).cloned())?;
+
         match coe {
+            // If `my_coe: x > z` is a straight-shot, just return `(my_coe (e: x)) : z`
             Coe::Single { term_num } => {
-                //let args = Cons(expr.alloc(self), Nil.alloc(self));
                 Ok(MmzExpr::App { 
                     term_num,
                     num_args: 1,
-                    args: self.alloc(bumpalo::vec![in self.bump; expr])
+                    args: self.alloc(bumpalo::vec![in self.bump; e_x]),
+                    sort: z
                 })
             },
 
-            Coe::Trans { sort_num, .. } => {
-                self.coerce(expr, sort, sort_num)
-                .and_then(|inner| self.coerce(inner, sort_num, tgt))
+            // If this is a transitive coercion `x > y > z`, return `(y_to_z (x_to_y (e: x)))`k
+            Coe::Trans { middleman_sort: y, .. } => {
+                self.coerce(e_x, y)
+                .and_then(|y_expr| self.coerce(y_expr, z))
             },
         }
-    }
+    }    
 
     fn kw(&mut self, k: &[u8]) -> Option<&'a [u8]> {
         let rollback = self.mem.mmz_pos;
@@ -532,6 +535,13 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         Ok((constant, prec))
     }
 
+    // for all coercions from `x` to `ys`, if `y e. ys` is provable
+    // insert `x |-> y` into `provs`.
+    // If a pair `x |-> y` already existed, throw an error.
+    // For example, if there are two
+    // x |-> nat
+    // x |-> nat
+    // You have a diamond.
     fn update_provs(&mut self) -> Res<()> {
         let mut provs = HashMap::with_hasher(Default::default());
         for (s1, m) in self.mem.coes.iter() {
@@ -565,63 +575,87 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         Ok(())
     }
 
+    /// Suppose we wanted to add some coercion coercion my_coe: x > y;`
+    /// 
+    /// In doing so, we need to consider the transitive coercions "on either side. c
+    /// That is, coercions from a sort `w` to `x`, and coercions from `y` to a sort `z`.
+    /// In doing so, we need to:
+    /// 1. Account for new transitive coercions that will result from the addition
+    /// 2. Make sure we didn't create any cycles
+    /// 3. Make sure we didn't create any diamonds.
     fn add_coe_raw(
         &mut self,
         term: Term,
-        from: u8,
-        to: u8,
+        x: u8,
+        y: u8,
     ) -> Res<()> {
-        match self.mem.coes.get(&from).and_then(|m| m.get(&to)) {
+        // If the coercion `x > y` already exists, do nothing, otherwise continue
+        // knowing that `x > y` is unique.
+        match self.mem.coes.get(&x).and_then(|m| m.get(&y)) {
             Some(&Coe::Single { term_num }) if term_num == term.term_num => return Ok(()),
             _ => {}
         }
 
-        let c1 = Arc::new(Coe::Single { term_num: term.term_num });
+        // Make the new coercion `x > y` with whatever term_num corresponds to `my_coe`.
+        let coe_x_y = Arc::new(Coe::Single { term_num: term.term_num });
 
+        // Holds:
+        // 1. The original coercion `x > y`
+        // 2. All transitive coercions `w > y`
+        // 3. All transitive coercions `x > z`
         let mut todo = BumpVec::new_in(self.bump);
 
-        for (sl, m) in self.mem.coes.iter() {
-            if let Some(c) = m.get(&from) {
+        // For any coercions already declared that go (either directly or transitively)
+        // from `w > x`, place (w, y, (Trans { w > x, x, w > y })) in `todo`
+        for (w, coes_w_xs) in self.mem.coes.iter() {
+            if let Some(coe_w_x) = coes_w_xs.get(&x) {
                 todo.push((
-                    *sl,
-                    to,
-                    Arc::new(Coe::Trans{
-                        c1: Arc::new(c.clone()), 
-                        sort_num: from, 
-                        c2: c1.clone()
+                    *w,
+                    y,
+                    Arc::new(Coe::Trans {
+                        c1: Arc::new(coe_w_x.clone()), 
+                        middleman_sort: x, 
+                        c2: coe_x_y.clone()
                     }),
                 ))
             }
         }
 
-        todo.push((from, to, c1.clone()));
+        todo.push((x, y, coe_x_y.clone()));
 
-        if let Some(m) =self.mem.coes.get(&to) {
-            for (sr, c) in m {
+        // For any existing coercion `y > z`, push 
+        // (x, z, Trans { x > y, y, y > z })
+        // onto `todos`
+        if let Some(m) = self.mem.coes.get(&y) {
+            for (z, y_to_z) in m {
                 todo.push((
-                    from,
-                    *sr,
+                    x,
+                    *z,
                     Arc::new(Coe::Trans{
-                        c1: c1.clone(), 
-                        sort_num: from, 
-                        c2: Arc::new(c.clone())
+                        c1: coe_x_y.clone(), 
+                        middleman_sort: y, 
+                        c2: Arc::new(y_to_z.clone())
                     }),
                 ))
             }
         }
 
-        for (sl, sr, c) in todo {
-            if sl == sr {
-                println!("Coercion cycle detected!");
-                panic!();
+        // If the addition of `x > y` would create a transitive coercion
+        // such what `w > x > y > w`, we've created a cycle.
+        for (w, z, coe) in todo {
+            if w == z {
+                return Err(VerifErr::Msg(format!("Coercion cycle detected!")));
             }
-            if let Some(_) =self.mem.coes.entry(sl).or_default().insert(sr, c.as_ref().clone()) {
-                println!("Coercion diamond detected!");
-                panic!()
+            // If, when inserting the transitive coercion `w > z`, we find an existing 
+            // coercion `w > z`, we know there's a diamond being created since the first 
+            // thing we did was confirm that there was no existing coercion `x > y`.
+            // Therefore, there's some alternate path between `w` and `z`.
+            if let Some(_) =self.mem.coes.entry(w).or_default().insert(z, coe.as_ref().clone()) {
+                return Err(VerifErr::Msg(format!("Coercion diamond detected!")));
             }
         }
         Ok(())
-    }    
+    }      
 
     fn elab_coe(
         &mut self,
@@ -815,8 +849,8 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
         if term.is_def() && self.peek_word() == b"=" {
             localize!(self.guard(b'='))?;
-            let (rhs_e, rhs_s) = self.expr_()?;
-            let rhs_e = self.coerce(rhs_e, rhs_s, self.mem.coe_prov_or_else(rhs_s))?;
+            let rhs_e = self.expr_()?;
+            let rhs_e = self.coerce(rhs_e, self.mem.coe_prov_or_else(rhs_e.sort()))?;
             self.check_expr(term.unify(), rhs_e, UMode::UDef)?;
         }
 
@@ -953,8 +987,8 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         // No bound hyps
         make_sure!(!bound);
         // Has to be either an axiom or a theorem to have hyps
-        let (math_expr, math_sort) = self.expr_()?;
-        let math_expr = self.coerce(math_expr, math_sort,self.mem.coe_prov_or_else(math_sort))?;
+        let math_expr = self.expr_()?;
+        let math_expr = self.coerce(math_expr, self.mem.coe_prov_or_else(math_expr.sort()))?;
         for (ident, dummy) in self.vars_todo.iter().skip(self.vars_done.len()) {
             make_sure!(!dummy);
             let pos = self.vars_done.len();
@@ -1001,8 +1035,8 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             // If it's a hypothesis
             if let Some(b'$') = { self.skip_ws(); self.cur() } {
                 make_sure!(mode == "assert"); 
-                let (math_expr, math_sort) = self.expr_()?;
-                let math_expr = self.coerce(math_expr, math_sort,self.mem.coe_prov_or_else(math_sort))?;
+                let math_expr = self.expr_()?;
+                let math_expr = self.coerce(math_expr, self.mem.coe_prov_or_else(math_expr.sort()))?;
                 self.hyps.push(MmzHyp { ident: None, pos: None, expr: math_expr });
             } else {
                 // If it's an arrow type.
@@ -1036,7 +1070,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         self.ustack.push(tgt);
 
         for v in self.vars_done.iter().filter(|v| !v.is_dummy) {
-            self.uheap.push(v.to_parse_var());
+            self.uheap.push(MmzExpr::Var(*v))
         }
 
         for maybe_cmd in u {
@@ -1063,7 +1097,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                 UnifyCmd::Dummy { sort_id } => {
                     make_sure!(mode == UMode::UDef);
                     let p = none_err!(self.ustack.pop())?;
-                    if let MmzExpr::Var { ty, is_dummy, .. } = p {
+                    if let MmzExpr::Var(MmzVar { ty, is_dummy, .. }) = p {
                         make_sure!(sort_id == ty.sort());
                         make_sure!(is_dummy);
                         self.uheap.push(p)

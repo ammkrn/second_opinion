@@ -16,7 +16,6 @@ use crate::util::{
     Res,
     VerifErr,
     Str,
-    SortNum,
     Term,
 };
 
@@ -138,40 +137,40 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     /// For initial calls to `expr`; expects the parser to have something 
     /// surrounded by `$` delimiters.
-    pub fn expr_(&mut self) -> Res<(MmzExpr<'b>, SortNum)> {
+    pub fn expr_(&mut self) -> Res<MmzExpr<'b>> {
         localize!(self.guard(b'$'))?;
-        let (out_l, out_r) = self.expr(Prec::Num(0))?;
+        let out_e = self.expr(Prec::Num(0))?;
         self.skip_math_ws();
         if let Some(b'$') = self.cur() {
             self.advance(1)
         }
         
-        Ok((out_l, out_r))
+        Ok(out_e)
     }    
 
     /// For recursive calls to `expr`; doesn't demand a leading `$` token
-    fn expr(&mut self, p: Prec) -> Res<(MmzExpr<'b>, SortNum)> {
-        let (lhs_e, lhs_s) = self.prefix(p)?;
-        self.lhs(p, (lhs_e, lhs_s))
+    fn expr(&mut self, p: Prec) -> Res<MmzExpr<'b>> {
+        let lhs_e = self.prefix(p)?;
+        self.lhs(p, lhs_e)
     }    
 
-    fn term_app(&mut self, this_prec: Prec, tok: &Str<'a>) -> Res<(MmzExpr<'b>, SortNum)> {
+    fn term_app(&mut self, this_prec: Prec, tok: &Str<'a>) -> Res<MmzExpr<'b>> {
         let term = self.mem.get_term_by_ident(&tok)?;
         if term.num_args_no_ret() == 0 {
-            Ok((MmzExpr::App { 
+            Ok(MmzExpr::App { 
                 term_num: term.term_num, 
                 num_args: 0, 
-                args: self.alloc(BumpVec::new_in(self.bump)) 
-            }, 
-            term.sort()))
+                args: self.alloc(BumpVec::new_in(self.bump)),
+                sort: term.sort()
+            })
         } else {
             make_sure!(this_prec <= Prec::Num(APP_PREC));
             let mut sig_args = BumpVec::new_in(self.bump);
             let mut restore = self.mem.mmz_pos;
 
             for arg in term.args() {
-                if let Ok((e_, s_)) = self.expr(Prec::Max) {
-                    sig_args.push(self.coerce(e_, s_, arg.sort())?);
+                if let Ok(e_) = self.expr(Prec::Max) {
+                    sig_args.push(self.coerce(e_, arg.sort())?);
                     restore = self.mem.mmz_pos;
                 } else {
                     self.mem.mmz_pos = restore;
@@ -179,48 +178,46 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                 }
             }
 
-            Ok((
-                MmzExpr::App {
-                    term_num: term.term_num,
-                    num_args: term.num_args_no_ret(),
-                    args: self.alloc(sig_args).as_slice()
-                },
-                term.sort()
-            ))
+            Ok(MmzExpr::App {
+                term_num: term.term_num,
+                num_args: term.num_args_no_ret(),
+                args: self.alloc(sig_args).as_slice(),
+                sort: term.sort()
+            })
         }
     }
 
-    fn prefix(&mut self, this_prec: Prec) -> Res<(MmzExpr<'b>, SortNum)> {
+    fn prefix(&mut self, this_prec: Prec) -> Res<MmzExpr<'b>> {
         self.skip_math_ws();
         if let Some(b'(') = self.cur() {
             self.advance(1);
-            let (e, s) = self.expr(Prec::Num(0))?;
+            let e = self.expr(Prec::Num(0))?;
             self.guard_math(b')')?;
-            return Ok((e, s))
+            return Ok(e)
         } 
 
         let tok = none_err!(self.math_tok())?;
         if let Some(q) = self.mem.consts.get(&tok).copied() {
             self.prefix_const(this_prec, &tok, q)
         } else if let Some(mmz_var) = self.vars_done.iter().find(|v| v.ident == Some(tok)) {
-            Ok((mmz_var.to_parse_var(), mmz_var.ty.sort()))
+            Ok(MmzExpr::Var(*mmz_var))
         } else {
             self.term_app(this_prec, &tok)
         }
     }
 
-    fn prefix_const(&mut self, last_prec: Prec, tok: &Str<'a>, next_prec: Prec) -> Res<(MmzExpr<'b>, SortNum)> {
+    fn prefix_const(&mut self, last_prec: Prec, tok: &Str<'a>, next_prec: Prec) -> Res<MmzExpr<'b>> {
         if next_prec >= last_prec {
             if let Some(pfx_info) = self.mem.prefixes.get(tok).cloned() {
                 let term_num = pfx_info.term_num;
                 let term = self.mem.outline.get_term_by_num(term_num)?;
                 let args = self.literals(pfx_info.lits.as_ref(), term)?;
-                let ret = MmzExpr::App {
+                return Ok(MmzExpr::App {
                     term_num,
                     num_args: term.num_args_no_ret(),
-                    args: self.alloc(args)
-                };
-                return Ok((ret, term.sort()))
+                    args: self.alloc(args),
+                    sort: term.sort(),
+                })
             }
         } 
         Err(VerifErr::Msg(format!("bad prefix const")))
@@ -245,10 +242,10 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                     make_sure!(tk == *fml);
                 }
                 NotationLit::Var { pos, prec } => {
-                    let (e, s) = self.expr(*prec)?;
+                    let e = self.expr(*prec)?;
                     let nth_arg = none_err!(term.args().nth(*pos))?;
                     let tgt_sort = nth_arg.sort();
-                    let coerced = self.coerce(e, s, tgt_sort)?;
+                    let coerced = self.coerce(e, tgt_sort)?;
                     match math_args.get_mut(*pos) {
                         Some(x @ None) => *x = Some(coerced),
                         _ => return Err(VerifErr::Msg(format!("misplaced variable in math_parser::literals")))
@@ -307,43 +304,40 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     /// lhs and lhs2 are mutually recursive functions that form the part of the pratt parser
     /// that deals with the presence of infix tokens.
-    fn lhs(&mut self, p: Prec, (lhs_e, lhs_s): (MmzExpr<'b>, SortNum)) -> Res<(MmzExpr<'b>, SortNum)> {
-        // If the next token is a >= infix notation...
+    fn lhs(&mut self, p: Prec, lhs_e: MmzExpr<'b>) -> Res<MmzExpr<'b>> {
         if let Some((ge_infix_term, ge_infix_prec)) = self.take_ge_infix(p).transpose()? {
-            let (rhs_e, rhs_s) = self.prefix(ge_infix_prec)?;
-            let (new_lhs_e, new_lhs_s) = self.lhs2((lhs_e, lhs_s), (ge_infix_term, ge_infix_prec), (rhs_e, rhs_s))?;
-            self.lhs(p, (new_lhs_e, new_lhs_s))
+            let rhs_e = self.prefix(ge_infix_prec)?;
+            let new_lhs_e = self.lhs2(lhs_e, (ge_infix_term, ge_infix_prec), rhs_e)?;
+            self.lhs(p, new_lhs_e)
         } else {
-        // If no ge_infix_term, recursion stops; give back args
-            Ok((lhs_e, lhs_s))
+            Ok(lhs_e)
         }
     }
 
     fn lhs2(
         &mut self,
-        (lhs_e, lhs_s): (MmzExpr<'b>, SortNum),
+        lhs_e: MmzExpr<'b>,
         (infix_term, infix_prec): (Term<'a>, Prec),
-        (rhs_e, rhs_s): (MmzExpr<'b>, SortNum),
-    ) -> Res<(MmzExpr<'b>, SortNum)> {
+        rhs_e: MmzExpr<'b>,
+    ) -> Res<MmzExpr<'b>> {
         if let Some((_, next_prec, _)) = self.peek_stronger_infix(infix_prec) {
-            let (new_rhs_e, new_rhs_s) = self.lhs(next_prec, (rhs_e, rhs_s))?;
-            self.lhs2((lhs_e, lhs_s), (infix_term, infix_prec), (new_rhs_e, new_rhs_s))
+            let new_rhs_e = self.lhs(next_prec, rhs_e)?;
+            self.lhs2(lhs_e, (infix_term, infix_prec), new_rhs_e)
         } else {
             let mut args = infix_term.args();
             if let (Some(fst), Some(snd), Some(_), None) = (args.next(), args.next(), args.next(), args.next()) {
                 let end_args = bumpalo::vec![
                     in self.bump;
-                    self.coerce(lhs_e, lhs_s, fst.sort())?,
-                    self.coerce(rhs_e, rhs_s, snd.sort())?
+                    self.coerce(lhs_e, fst.sort())?,
+                    self.coerce(rhs_e, snd.sort())?
                 ];
 
-                let new_lhs_e = MmzExpr::App {
+                Ok(MmzExpr::App {
                     term_num: infix_term.term_num,
                     num_args: infix_term.num_args_no_ret(),
-                    args: self.alloc(end_args)
-                };
-                let new_lhs_s = infix_term.sort();
-                Ok((new_lhs_e, new_lhs_s))
+                    args: self.alloc(end_args),
+                    sort: infix_term.sort()
+                })
             } else {
                 panic!()
             }

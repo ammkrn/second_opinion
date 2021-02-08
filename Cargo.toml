@@ -1,6 +1,6 @@
 [package]
 name = "second_opinion"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["ammkrn_"]
 edition = "2018"
 

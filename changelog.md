@@ -16,3 +16,8 @@
 + Remove mmz string sharing (remove indexmap and rustchash dependencies)
 + Change error reporting in main since mmz_mem is no longer `Send`.
 + style changes in math parser
+
+## 0.1.2 -> 0.1.3
+
++ Add `occupied_precs` map for math-parser disambiguation.
++ refactor lhs handling in math-parser

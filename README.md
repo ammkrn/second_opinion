@@ -5,7 +5,8 @@ A verifier for [Metamath Zero](https://github.com/digama0/mm0) proof files.
 ## short-term TODOs
 - Improve interface
 - Work on inline docs
-- Better errors/error-handling
+- Better errors/error-handling. 
+- The mmz parser needs a smart way to skip past any errors.
 - Redo the pos/idx counters for variables in the mmz parser so that they ignore dummy variables instead of compensating for them.
 - I think the parser should deal with an &str source instead of &[u8] for mmz files since you already know it has to be ascii. This would make some stuff nicer and let us get rid of `Str`
 - More tests. It would be cool to do some property-based testing, but it's not always easy to identify meaningful invariants.

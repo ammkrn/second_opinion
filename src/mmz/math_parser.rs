@@ -1,3 +1,6 @@
+//! This module implements an operator precedence parser which aims to turn `$`-delimited math strings 
+//! (sometimes also called "formulas") into mm0 expressions while allowing for the use of user-defined notation.
+
 use bumpalo::collections::Vec as BumpVec;
 use crate::mmz::parse::{ wc, trim };
 use crate::none_err;
@@ -132,30 +135,51 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         }
     }    
  
-
-
-
-    /// For initial calls to `expr`; expects the parser to have something 
-    /// surrounded by `$` delimiters.
+    /// The main entry point to the math parser. When the mmz parser wants
+    /// to parse an expression from a new math string (`$ .. $`), it calls this.
     pub fn expr_(&mut self) -> Res<MmzExpr<'b>> {
         localize!(self.guard(b'$'))?;
-        let out_e = self.expr(Prec::Num(0))?;
+        let out_e = self.expr(Prec::Num(0), None)?;
         self.skip_math_ws();
         if let Some(b'$') = self.cur() {
             self.advance(1)
         }
-        
         Ok(out_e)
     }    
 
-    /// For recursive calls to `expr`; doesn't demand a leading `$` token
-    fn expr(&mut self, p: Prec) -> Res<MmzExpr<'b>> {
-        let lhs_e = self.prefix(p)?;
-        self.lhs(p, lhs_e)
-    }    
+    /// Gets a pair (prec, expr), and tries to continue parsing the rest
+    /// of some math string held onto by `self`, which holds the mmz file,
+    /// and by extension the math string we're working on.
+    fn expr(&mut self, initial_prec: Prec, accum: Option<MmzExpr<'b>>) -> Res<MmzExpr<'b>> {
+        match accum {
+            // This was an initial call to `expr`; there's no accumulating expression yet.
+            None => {
+                let prefix = self.prefix(initial_prec)?;
+                self.expr(initial_prec, Some(prefix))
+            },
+            // This is a continuation call, adding to some accumulating expression.
+            // These calls can only come from calls to `expr` made from within
+            // the module.
+            Some(a) => match self.take_ge_infix(initial_prec).transpose()? {
+                // We've reached the end of the current expression, either
+                // because the math-string is over, or because initial_prec > next_prec
+                None => Ok(a),
+                // Continue adding to this accumulator.
+                // we have: (prec_low, a) .. $ `op2:prec_high` b .. $
+                Some((op_term, op_prec)) => {
+                    let b = self.prefix(op_prec)?;
+                    let a_until_lt = self.lhs(a, (op_term, op_prec), b)?;
+                    self.expr(initial_prec, Some(a_until_lt))
+                }
+            }
+        }
+    }
 
+    /// `prefix` determined we have a raw term application, so just parse the arguments
+    /// and return `App { t, args* }`
     fn term_app(&mut self, this_prec: Prec, tok: &Str<'a>) -> Res<MmzExpr<'b>> {
         let term = self.mem.get_term_by_ident(&tok)?;
+        // If this is a 0-ary term.
         if term.num_args_no_ret() == 0 {
             Ok(MmzExpr::App { 
                 term_num: term.term_num, 
@@ -169,7 +193,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             let mut restore = self.mem.mmz_pos;
 
             for arg in term.args() {
-                if let Ok(e_) = self.expr(Prec::Max) {
+                if let Ok(e_) = self.expr(Prec::Max, None) {
                     sig_args.push(self.coerce(e_, arg.sort())?);
                     restore = self.mem.mmz_pos;
                 } else {
@@ -187,11 +211,17 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         }
     }
 
+    /// Parse one of the following:
+    ///
+    /// 1. An expression surrounded by parentheses
+    /// 2. An expression using either a prefix notation or a general notation
+    /// 3. An occurrence of a declared variable
+    /// 4. A raw term application (like `not ph`)
     fn prefix(&mut self, this_prec: Prec) -> Res<MmzExpr<'b>> {
         self.skip_math_ws();
         if let Some(b'(') = self.cur() {
             self.advance(1);
-            let e = self.expr(Prec::Num(0))?;
+            let e = self.expr(Prec::Num(0), None)?;
             self.guard_math(b')')?;
             return Ok(e)
         } 
@@ -206,46 +236,54 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         }
     }
 
+    /// If `prefix` determines we have either a prefix notation or a general notation,
+    /// use this to try and aprse the correct arguments, applying them to whatever
+    /// term corresponds to the notation symbol being used.
     fn prefix_const(&mut self, last_prec: Prec, tok: &Str<'a>, next_prec: Prec) -> Res<MmzExpr<'b>> {
         if next_prec >= last_prec {
             if let Some(pfx_info) = self.mem.prefixes.get(tok).cloned() {
                 let term_num = pfx_info.term_num;
                 let term = self.mem.outline.get_term_by_num(term_num)?;
-                let args = self.literals(pfx_info.lits.as_ref(), term)?;
-                return Ok(MmzExpr::App {
-                    term_num,
-                    num_args: term.num_args_no_ret(),
-                    args: self.alloc(args),
-                    sort: term.sort(),
-                })
+                return self.apply_notation(pfx_info.lits.as_ref(), term)
             }
         } 
         Err(VerifErr::Msg(format!("bad prefix const")))
     }    
 
-    fn literals(
+    /// Having previously parsed a prefix or general notation and determined its
+    /// corresponding `term`, parse and check the arguments demanded by that `term`
+    /// and then apply them, returning the `App t e*` expression.
+    fn apply_notation(
         &mut self, 
-        lits: &[NotationLit<'a>], 
+        declar_lits: &[NotationLit<'a>], 
         term: Term<'a>, 
-    ) -> Res<BumpVec<'b, MmzExpr<'b>>> {
+    ) -> Res<MmzExpr<'b>> {
+        // A vec of `[None, .., None]` for as many `NotationLit::Var {..}`  are demanded by the term's signature.
+        // The option stuff is a safe workaround for the fact that they may occur out of order relative to the
+        // underlying term's signature.
         let mut math_args = BumpVec::new_in(self.bump);
-        for lit in lits {
-            if let NotationLit::Var {..} = lit {
+        for declar_lit in declar_lits {
+            if let NotationLit::Var {..} = declar_lit {
                 math_args.push(None)
             }
         }
 
-        for lit in lits {
+        // For each item (var or symbol) in the original notation declaration,
+        // If it's a Const/symbol, make sure the one in the math string is right
+        for lit in declar_lits {
             match lit {
+                // Make sure the notation characters present in the math-string
+                // match those specified in the original notation declaration.
                 NotationLit::Const(fml) => {
                     let tk = none_err!(self.math_tok())?;
                     make_sure!(tk == *fml);
                 }
+                // Make sure the variable in the math string has the sort called
+                // for by the variable in the notation declaration.
                 NotationLit::Var { pos, prec } => {
-                    let e = self.expr(*prec)?;
-                    let nth_arg = none_err!(term.args().nth(*pos))?;
-                    let tgt_sort = nth_arg.sort();
-                    let coerced = self.coerce(e, tgt_sort)?;
+                    let sig_e = none_err!(term.args().nth(*pos))?;
+                    let e = self.expr(*prec, None)?;
+                    let coerced = self.coerce(e, sig_e.sort())?;
                     match math_args.get_mut(*pos) {
                         Some(x @ None) => *x = Some(coerced),
                         _ => return Err(VerifErr::Msg(format!("misplaced variable in math_parser::literals")))
@@ -254,6 +292,8 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             }
         }
 
+        // Collect the actual arguments that were present in the math-string
+        // now that they've been checked, removing the `Option`.
         let mut out = BumpVec::new_in(self.bump);
         for arg in math_args {
             match arg {
@@ -262,12 +302,18 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             }
         }
 
-        Ok(out)
-    }    
+        Ok(MmzExpr::App {
+            term_num: term.term_num,
+            num_args: term.num_args_no_ret(),
+            args: self.alloc(out),
+            sort: term.sort(),
+        })        
+
+    }      
 
     /// If the next peeked token is an *infix* operator with a precedence that is greater than or
-    /// equal to the last precedence, return (notation token, Prec, notation info)
-    fn peek_stronger_infix(&mut self, last_prec: Prec) -> Option<(Str<'a>, Prec, NotationInfo<'a>)> {
+    /// equal to the last precedence, return (token, Prec, notation info)
+    fn peek_ge_infix(&mut self, last_prec: Prec) -> Option<(Str<'a>, Prec, NotationInfo<'a>)> {
         let peeked = self.peek_math_tok()?;
         let next_prec = self.mem.consts.get(&peeked).copied()?;
         if (next_prec >= last_prec) {
@@ -288,7 +334,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     /// 
     /// DOES advance the parser.
     fn take_ge_infix(&mut self, last_prec: Prec) -> Option<Res<(Term<'a>, Prec)>> {
-        let (_, next_prec, notation_info) = self.peek_stronger_infix(last_prec)?;
+        let (_, next_prec, notation_info) = self.peek_ge_infix(last_prec)?;
         let infix_term = self.mem.outline.get_term_by_num(notation_info.term_num);
         self.math_tok().unwrap();
         Some(
@@ -302,46 +348,38 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         )
     }    
 
-    /// lhs and lhs2 are mutually recursive functions that form the part of the pratt parser
-    /// that deals with the presence of infix tokens.
-    fn lhs(&mut self, p: Prec, lhs_e: MmzExpr<'b>) -> Res<MmzExpr<'b>> {
-        if let Some((ge_infix_term, ge_infix_prec)) = self.take_ge_infix(p).transpose()? {
-            let rhs_e = self.prefix(ge_infix_prec)?;
-            let new_lhs_e = self.lhs2(lhs_e, (ge_infix_term, ge_infix_prec), rhs_e)?;
-            self.lhs(p, new_lhs_e)
-        } else {
-            Ok(lhs_e)
-        }
-    }
-
-    fn lhs2(
+    // From `(a, op1, b)`, either continue adding to the right-hand side if there's a stronger operator next
+    // or finish and return `App { op1 a b }`
+    fn lhs(
         &mut self,
-        lhs_e: MmzExpr<'b>,
-        (infix_term, infix_prec): (Term<'a>, Prec),
-        rhs_e: MmzExpr<'b>,
+        a: MmzExpr<'b>,
+        (op0_term, op0_prec): (Term<'a>, Prec),
+        b: MmzExpr<'b>,
     ) -> Res<MmzExpr<'b>> {
-        if let Some((_, next_prec, _)) = self.peek_stronger_infix(infix_prec) {
-            let new_rhs_e = self.lhs(next_prec, rhs_e)?;
-            self.lhs2(lhs_e, (infix_term, infix_prec), new_rhs_e)
+        // If the next token in the math-string is an infix, such that op0_prec <= op1_prec,
+        // recurse with lhs(a, op0, (b op1 c*..))
+        if let Some((op1_term, op1_prec)) = self.take_ge_infix(op0_prec).transpose()? {
+            let c = self.prefix(op1_prec)?;
+            let b_op_cprime = self.lhs(b, (op1_term, op1_prec), c)?;
+            self.lhs(a, (op0_term, op0_prec), b_op_cprime)
         } else {
-            let mut args = infix_term.args();
-            if let (Some(fst), Some(snd), Some(_), None) = (args.next(), args.next(), args.next(), args.next()) {
-                let end_args = bumpalo::vec![
-                    in self.bump;
-                    self.coerce(lhs_e, fst.sort())?,
-                    self.coerce(rhs_e, snd.sort())?
-                ];
+            // Next item is None or a weaker infix, so return `App { op1 a b }`
+            let mut plus_args = op0_term.args();
+            if let (Some(fst), Some(snd), Some(_), None) = (plus_args.next(), plus_args.next(), plus_args.next(), plus_args.next()) {
+                let a_coerced = self.coerce(a, fst.sort())?;
+                let b_coerced = self.coerce(b, snd.sort())?;
 
                 Ok(MmzExpr::App {
-                    term_num: infix_term.term_num,
-                    num_args: infix_term.num_args_no_ret(),
-                    args: self.alloc(end_args),
-                    sort: infix_term.sort()
+                    term_num: op0_term.term_num,
+                    num_args: op0_term.num_args_no_ret(),
+                    args: self.alloc(bumpalo::vec![in self.bump; a_coerced, b_coerced]),
+                    sort: op0_term.sort()
                 })
             } else {
-                panic!()
+                Err(VerifErr::Msg(format!("math_parser::lhs2 got a list of infix args that had some number of elems not equal to (2 + 1)")))
             }
         }
-    }   
+    }     
+
 }
 

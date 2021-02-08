@@ -14,6 +14,7 @@ use crate::mmz::{
     Coe,
     MmzVar,
     MmzHyp,
+    Assoc
 };
 use crate::util::{ 
     Mods, 
@@ -33,6 +34,9 @@ use crate::localize;
 use crate::none_err;
 use crate::mmb::unify::{ UnifyCmd, UnifyIter, UMode };
 
+/// Demand a Prec::Num (err owise);
+/// 
+/// If true, return (Prec + 1) else Prec
 fn bump<'a>(yes: bool, _: Str<'a>, p: Prec) -> Prec {
     if !yes {
         p
@@ -138,7 +142,7 @@ impl<'b, 'a: 'b> MmzMem<'a> {
                      b"coercion" => mmz_st.coercion()?,
                      b"import" => mmz_st.parse_import()?,
                      b"input" => return Err(VerifErr::Msg(format!("`input` statements are not currently suppprted"))),
-                     b"output" => return Err(VerifErr::Msg(format!("Output statements are not currently supported"))),
+                     b"output" => return Err(VerifErr::Msg(format!("`output` statements are not currently supported"))),
                      _ => break 'inner,
                 }                
             }
@@ -390,6 +394,7 @@ fn add_nota_info<'a>(
             return Err(VerifErr::Msg(format!("Incompatible error in add_nota_info")))
         }
     }
+    
     Ok(())
 }
 
@@ -441,14 +446,15 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         Ok(())
     }
 
+    /// Add the association of `tok: Str |-> prec: Prec` to the map `MmzMem::consts`
     fn add_const(&mut self, tk: Str<'a>, prec: Prec) -> Res<()> {
         if tk.as_bytes() == b"(" || tk.as_bytes() == b")" {
-            return Err(VerifErr::Msg(format!("Parens not allowed as notation consts")));
+            return Err(VerifErr::Msg(format!("Parens not allowed as notation consts; they're reserved by mm0")));
         }
 
         match self.mem.consts.insert(tk, prec) {
             Some(already) if already != prec => {
-                Err(VerifErr::Msg(format!("Cannot redeclare const {:?} with new prec", tk)))
+                Err(VerifErr::Msg(format!("Cannot redeclare const {:?} with new prec. It was already declared with {:?}", tk, already)))
             },
             _ => Ok(())
         }
@@ -461,19 +467,20 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         term_num_args: u16,
         lits: Vec<Either<(Str<'a>, Prec), Str<'a>>>,
     ) -> Res<()> {
+
         let num_args_nota = self.vars_done.len();
         assert_eq!(num_args_nota, term_num_args as usize);
 
         let mut vars_used = BumpVec::new_in(self.bump);
         let mut it = lits.iter().peekable();
 
-        let (mut lits2, mut right_associative, tok, prec) = match it.next() {
+        let (mut lits2, mut right_associative, tok, first_prec) = match it.next() {
             None => panic!("Notation requires at least one literal"),
             Some(L((tok, prec))) => (Vec::<NotationLit>::new(), true, tok, prec),
             Some(R(_)) => panic!("generalized infix not allowed in mm0")
         };
 
-        self.add_const(*tok, prec.clone())?;
+        self.add_const(*tok, first_prec.clone())?;
         if it.peek().is_none() {
             right_associative = false;
         }
@@ -485,9 +492,14 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                     self.add_const(tok, prec)?
                 }
                 R(var_ident) => {
+                    // In assigning the variable its precedence...
+                    // If there's no const/symbol after it, 
                     let prec = match it.peek() {
-                        None => bump(right_associative, *tok, *prec),
+                        None => bump(right_associative, *tok, *first_prec),
+                        // If you have [.., var, symbol, .. ] then try to bump
+                        // the prec of the variable by one.
                         Some(L((tok2, prec2))) => bump(true, *tok2, *prec2),
+                        // If the next token is another var, give Prec::Max
                         Some(R(_)) => Prec::Max,
                     };
                     vars_used.push(var_ident);
@@ -507,6 +519,12 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             } else {
                 return Err(VerifErr::Msg(format!("anonymous vars not allowed in general notation declarations!")))
             }
+        }
+
+        // If the notation declartion ends with a variable, it's considered 
+        // right-associative for the precedence disambiguation.
+        if let NotationLit::Var {..} = none_err!(lits2.last())? {
+            self.mem.occupy_prec(term_ident, *first_prec, Assoc::Right)?;
         }
 
         let info = NotationInfo {
@@ -739,13 +757,17 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             rassoc: true,
             lits: Arc::from(lits),
         };
-
         //self
         //.declared_notations
         //.entry(term_ident)
         //.or_default()
         //.consts
         //.push((constant, Some(Fix::Prefix)));        
+
+        // 0-ary prefixes don't affect the occupied map.
+        if term.num_args_no_ret() > 0 {
+            self.mem.occupy_prec(term_ident, prec, Assoc::Right)?;
+        }
 
         add_nota_info(
             &mut self.mem.prefixes,
@@ -800,6 +822,12 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                 //.or_default()
                 //.consts
                 //.push((constant, Some(if is_infixr { Fix::Infixr } else { Fix::Infixl })));
+
+                if is_infixr {
+                    self.mem.occupy_prec(term_ident, prec, Assoc::Right)?
+                } else {
+                    self.mem.occupy_prec(term_ident, prec, Assoc::Left)?
+                }
 
                 add_nota_info(&mut self.mem.infixes, constant, info)
             }
@@ -859,6 +887,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         Ok(())
     }
 
+    /// Parse an `axiom` or a `theorem` from a .mm0 file
     pub fn parse_assert(
         &mut self, 
         assert: Assert<'a>,
@@ -877,6 +906,9 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         Ok(())
     }
 
+    /// Parse an import statement. At this point, all of the imports have
+    /// previously been parsed and resolved since they have to be handled
+    /// before the main mmz parse, so this just identifies and skips the statement.
     pub fn parse_import(&mut self) -> Res<()> {
         make_sure!(self.kw(b"import ").is_some());
         localize!(self.guard(b'"'))?;

@@ -9,12 +9,14 @@ use crate::util::{
 };
 use crate::none_err;
 
+const INDEX_NAME: u32 = 0x656D614E; // "Name"
+const INDEX_VAR_NAME: u32 = 0x4E726156; // "VarN"
+const INDEX_HYP_NAME: u32 = 0x4E707948; // "HypN"
+
 /// A parsed `MMB` file index.
 pub struct Index<'a> {
     /// The full file
     pub mmb: &'a [u8],
-    /// A pointer to the root of the binary search tree, for searching based on name.
-    pub root: u64,
     /// Pointers to the index entries for the sorts
     pub sorts: Vec<u64>,
     /// Pointers to the index entries for the terms
@@ -27,7 +29,6 @@ pub struct Index<'a> {
 impl<'a> Debug for Index<'a> {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         let mut d = f.debug_struct("Index");
-        d.field("root", &self.root);
         d.field("sorts", &self.sorts);
         d.field("terms", &self.terms);
         d.field("thms", &self.thms);
@@ -39,7 +40,6 @@ impl<'a> std::default::Default for Index<'a> {
     fn default() -> Index<'a> {
         Index {
             mmb: b"",
-            root: 0,
             sorts: Vec::new(),
             terms: Vec::new(),
             thms: Vec::new(),
@@ -111,21 +111,40 @@ fn parse_cstr<'a>(source: &'a [u8]) -> Option<&'a [u8]> {
 }
 
 pub fn parse_index<'a>(mmb: &'a [u8], header: Header) -> Res<Index<'a>> {
-    let (root, rest) = parse_u64(&mmb[header.index_start as usize..])
-        .expect("Failed to get u64 for index root");
-    let (sorts, rest) = prefix_u64(rest, header.num_sorts as usize)
-        .expect("Failed to get sorts in index");
-    let (terms, rest) = prefix_u64(rest, header.num_terms as usize)
-        .expect("Failed to get num terms");
-    let (thms, _) = prefix_u64(rest, header.num_thms as usize)
-        .expect("Failed to get num thms in index");
-    Ok(Index {
+    if header.index_start == 0 {
+        return Ok(Index::default())
+    }
+    let (num_entries, mut entry) = parse_u64(&mmb[header.index_start as usize..])
+        .expect("Failed to get u64 for number of index entries");
+    let mut index = Index {
         mmb,
-        root,
-        sorts,
-        terms,
-        thms,
-    })
+        sorts: vec![],
+        terms: vec![],
+        thms: vec![],
+    };
+    for _ in 0..num_entries {
+        let (id, rest) = parse_u32(entry).expect("Failed to get index type");
+        let (_data, rest) = parse_u32(rest).expect("Failed to get index data");
+        let (ptr, rest) = parse_u64(rest).expect("Failed to get index pointer");
+        entry = rest;
+        match id {
+            INDEX_NAME => {
+                let (sorts, rest) = prefix_u64(&mmb[ptr as usize..], header.num_sorts as usize)
+                    .expect("Failed to get sorts in index");
+                let (terms, rest) = prefix_u64(rest, header.num_terms as usize)
+                    .expect("Failed to get num terms");
+                let (thms, _) = prefix_u64(rest, header.num_thms as usize)
+                    .expect("Failed to get num thms in index");
+                index.sorts = sorts;
+                index.terms = terms;
+                index.thms = thms;
+            }
+            INDEX_VAR_NAME => {}
+            INDEX_HYP_NAME => {}
+            _ => {}
+        }
+    }
+    Ok(index)
 }
 
 #[inline]
@@ -135,7 +154,8 @@ pub fn prefix_u64(mut bytes: &[u8], num_elems: usize) -> Res<(Vec<u64>, &[u8])> 
     if split_point <= bytes.len() {
         let mut v = Vec::with_capacity(num_elems);
         for _ in 0..num_elems {
-            let (inner, rest_) = parse_u64(bytes)?;
+            let (_proof, rest) = parse_u64(bytes)?;
+            let (inner, rest_) = parse_u64(rest)?;
             bytes = rest_;
             v.push(inner);
         }

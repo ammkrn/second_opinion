@@ -239,7 +239,7 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
     pub fn take_next_bv(&mut self) -> u64 {
         let outgoing = self.next_bv;
         // Assert we're under the limit of 55 bound variables.
-        assert!(outgoing >> 56 == 0);
+        assert!(outgoing >> 55 == 0);
         self.next_bv *= 2;
         outgoing
     }    

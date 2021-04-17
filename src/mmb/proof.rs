@@ -52,8 +52,6 @@ pub const PROOF_CONG: u8 = 0x1A;
 pub const PROOF_UNFOLD: u8 = 0x1B;
 /// `PROOF_CONV_CUT = 0x1C`: See [`ProofCmd`](super::ProofCmd).
 pub const PROOF_CONV_CUT: u8 = 0x1C;
-/// `PROOF_CONV_REF = 0x1D`: See [`ProofCmd`](super::ProofCmd).
-pub const PROOF_CONV_REF: u8 = 0x1D;
 /// `PROOF_CONV_SAVE = 0x1E`: See [`ProofCmd`](super::ProofCmd).
 pub const PROOF_CONV_SAVE: u8 = 0x1E;
 /// `PROOF_SAVE = 0x1F`: See [`ProofCmd`](super::ProofCmd).
@@ -88,8 +86,11 @@ pub enum ProofCmd {
     },
     /// ```text
     /// Ref i: H; S --> H; S, Hi
+    /// ConvRef i: H; S, e1 =?= e2 --> H; S   (where Hi is e1 = e2)
     /// ```
-    /// Get the `i`-th heap element and push it on the stack.
+    /// Get the `i`-th heap element.
+    /// * If it is `e1 = e2`, pop a convertibility obligation `e1 =?= e2`.
+    /// * Otherwise push it on the stack.
     Ref(u32),
     /// ```text
     /// Dummy s: H; S --> H, x; S, x    alloc(x:s)
@@ -159,12 +160,6 @@ pub enum ProofCmd {
     /// push a convertability assertion `e1 = e2` guarded by `e1 =?= e2`.
     ConvCut,
     /// ```text
-    /// ConvRef i: H; S, e1 =?= e2 --> H; S   (where Hi is e1 = e2)
-    /// ```
-    /// Pop a convertibility obligation `e1 =?= e2`, where `e1 = e2` is
-    /// `i`-th on the heap.
-    ConvRef(u32),
-    /// ```text
     /// ConvSave: H; S, e1 = e2 --> H, e1 = e2; S
     /// ```
     /// Pop a convertibility proof `e1 = e2` and save it to the heap.
@@ -210,7 +205,6 @@ impl std::convert::TryFrom<(u8, u32)> for ProofCmd {
             PROOF_CONG => ProofCmd::Cong,
             PROOF_UNFOLD => ProofCmd::Unfold,
             PROOF_CONV_CUT => ProofCmd::ConvCut,
-            PROOF_CONV_REF => ProofCmd::ConvRef(data),
             PROOF_CONV_SAVE => ProofCmd::ConvSave,
             PROOF_SAVE => ProofCmd::Save,
             owise => {
@@ -284,7 +278,6 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
                 ProofCmd::Cong => self.proof_cong()?,
                 ProofCmd::Unfold => self.proof_unfold()?,
                 ProofCmd::ConvCut => self.proof_conv_cut()?,
-                ProofCmd::ConvRef(i) => self.proof_conv_ref(i)?,
                 ProofCmd::ConvSave => self.proof_conv_save()?,
                 ProofCmd::Save => self.proof_save()?,
             }
@@ -293,8 +286,18 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
     }    
 
     fn proof_ref(&mut self, i: u32) -> Res<()> {
-        let heap_elem = *&self.heap[i as usize];
-        Ok(self.stack.push(heap_elem))
+        match none_err!(self.heap.get(i as usize).copied())? {
+            MmbItem::Conv(c1, c2) => {
+                let stack_coconv = none_err!(self.stack.pop())?;
+                if let MmbItem::CoConv(cc1, cc2) = stack_coconv {
+                    make_sure!(c1 == cc1);
+                    Ok(make_sure!(c2 == cc2))
+                } else {
+                    return Err(VerifErr::Unreachable(file!(), line!()));
+                }
+            }
+            heap_elem => Ok(self.stack.push(heap_elem))
+        }
     }
 
     fn proof_dummy(&mut self, sort_num: u8) -> Res<()> {
@@ -510,9 +513,12 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
 
     fn proof_unfold(&mut self) -> Res<()> {
         let e_prime = none_err!(self.stack.pop())?;
-        let f_ebar = none_err!(self.stack.pop())?;
-        let (term_num, ebar) = match f_ebar {
-            MmbItem::Expr(MmbExpr::App{ term_num, args, .. }) => (term_num, args.clone()),
+        let cc = none_err!(self.stack.pop())?;
+
+        let (term_num, ebar, e_doubleprime) = match cc {
+            MmbItem::CoConv(MmbItem::Expr(MmbExpr::App{ term_num, args, .. }), e_doubleprime) => {
+                (term_num, args.clone(), e_doubleprime)
+            }
             _ => return Err(VerifErr::Unreachable(file!(), line!()))
         };
 
@@ -525,14 +531,8 @@ impl<'b, 'a: 'b> MmbState<'b, 'a> {
             e_prime,
         )?;
 
-        let cc = none_err!(self.stack.pop())?;
-        if let MmbItem::CoConv(f_ebar2, e_doubleprime) = cc {
-                make_sure!(f_ebar == *f_ebar2);
-                let coconv = self.alloc(MmbItem::CoConv(e_prime, e_doubleprime));
-                Ok(self.stack.push(coconv))
-        } else {
-            return Err(VerifErr::Unreachable(file!(), line!()));
-        }
+        let coconv = self.alloc(MmbItem::CoConv(e_prime, e_doubleprime));
+        Ok(self.stack.push(coconv))
     }      
 
     fn proof_conv_cut(&mut self) -> Res<()> {

@@ -146,12 +146,12 @@ pub enum ProofCmd {
     /// in declaration order in the proof stream.
     Cong,
     /// ```text
-    /// Unfold: S, (t e1 ... en) =?= e', (t e1 ... en), e --> S, e =?= e'
+    /// Unfold: S, (t e1 ... en) =?= e', e --> S, e =?= e'
     ///   (where Unify(t): e1, ..., en; e --> H'; .)
     /// ```
-    /// Pop terms `(t e1 ... en)`, `e` from the stack and run the unifier for `t`
+    /// Pop `e` and `(t e1 ... en) =?= e'` from the stack and run the unifier for `t`
     /// (which should be a definition) to make sure that `(t e1 ... en)` unfolds to `e`.
-    /// Then pop `(t e1 ... en) =?= e'` and push `e =?= e'`.
+    /// Then push `e =?= e'`.
     Unfold,
     /// ```text
     /// ConvCut: S, e1 =?= e2 --> S, e1 = e2, e1 =?= e2

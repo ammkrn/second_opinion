@@ -21,3 +21,10 @@
 
 + Add `occupied_precs` map for math-parser disambiguation.
 + refactor lhs handling in math-parser
+
+## 0.1.3 -> 0.1.4
+
++ Remove ConvRef
++ Update Ref/Update
++ Fix bug in function taking next bound variable
+

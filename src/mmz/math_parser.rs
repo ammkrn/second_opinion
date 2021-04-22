@@ -1,6 +1,7 @@
 //! This module implements an operator precedence parser which aims to turn `$`-delimited math strings 
 //! (sometimes also called "formulas") into mm0 expressions while allowing for the use of user-defined notation.
 
+use std::convert::TryFrom;
 use bumpalo::collections::Vec as BumpVec;
 use crate::mmz::parse::{ wc, trim };
 use crate::none_err;
@@ -19,8 +20,9 @@ use crate::util::{
     Res,
     VerifErr,
     Str,
-    Term,
 };
+use mm0_util::TermId;
+use mm0b_parser::TermRef;
 
 const APP_PREC: u32 = 1024;
 
@@ -180,9 +182,9 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     fn term_app(&mut self, this_prec: Prec, tok: &Str<'a>) -> Res<MmzExpr<'b>> {
         let term = self.mem.get_term_by_ident(&tok)?;
         // If this is a 0-ary term.
-        if term.num_args_no_ret() == 0 {
+        if term.args().len() == 0 {
             Ok(MmzExpr::App { 
-                term_num: term.term_num, 
+                term_num: term.tid, 
                 num_args: 0, 
                 args: self.alloc(BumpVec::new_in(self.bump)),
                 sort: term.sort()
@@ -192,7 +194,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             let mut sig_args = BumpVec::new_in(self.bump);
             let mut restore = self.mem.mmz_pos;
 
-            for arg in term.args() {
+            for arg in term.args_and_ret() {
                 if let Ok(e_) = self.expr(Prec::Max, None) {
                     sig_args.push(self.coerce(e_, arg.sort())?);
                     restore = self.mem.mmz_pos;
@@ -203,8 +205,8 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             }
 
             Ok(MmzExpr::App {
-                term_num: term.term_num,
-                num_args: term.num_args_no_ret(),
+                term_num: term.tid,
+                num_args: u16::try_from(term.args().len()).unwrap(),
                 args: self.alloc(sig_args).as_slice(),
                 sort: term.sort()
             })
@@ -243,7 +245,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         if next_prec >= last_prec {
             if let Some(pfx_info) = self.mem.prefixes.get(tok).cloned() {
                 let term_num = pfx_info.term_num;
-                let term = self.mem.outline.get_term_by_num(term_num)?;
+                let term = none_err!(self.mem.outline.file_view.mmb.term(TermId(term_num)))?;
                 return self.apply_notation(pfx_info.lits.as_ref(), term)
             }
         } 
@@ -256,7 +258,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     fn apply_notation(
         &mut self, 
         declar_lits: &[NotationLit<'a>], 
-        term: Term<'a>, 
+        term: TermRef<'a>, 
     ) -> Res<MmzExpr<'b>> {
         // A vec of `[None, .., None]` for as many `NotationLit::Var {..}`  are demanded by the term's signature.
         // The option stuff is a safe workaround for the fact that they may occur out of order relative to the
@@ -281,7 +283,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                 // Make sure the variable in the math string has the sort called
                 // for by the variable in the notation declaration.
                 NotationLit::Var { pos, prec } => {
-                    let sig_e = none_err!(term.args().nth(*pos))?;
+                    let sig_e = none_err!(term.args_and_ret().get(*pos))?;
                     let e = self.expr(*prec, None)?;
                     let coerced = self.coerce(e, sig_e.sort())?;
                     match math_args.get_mut(*pos) {
@@ -303,8 +305,8 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         }
 
         Ok(MmzExpr::App {
-            term_num: term.term_num,
-            num_args: term.num_args_no_ret(),
+            term_num: term.tid,
+            num_args: u16::try_from(term.args().len()).unwrap(),
             args: self.alloc(out),
             sort: term.sort(),
         })        
@@ -333,9 +335,9 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     /// is the same.
     /// 
     /// DOES advance the parser.
-    fn take_ge_infix(&mut self, last_prec: Prec) -> Option<Res<(Term<'a>, Prec)>> {
+    fn take_ge_infix(&mut self, last_prec: Prec) -> Option<Res<(TermRef<'a>, Prec)>> {
         let (_, next_prec, notation_info) = self.peek_ge_infix(last_prec)?;
-        let infix_term = self.mem.outline.get_term_by_num(notation_info.term_num);
+        let infix_term = none_err!(self.mem.outline.file_view.mmb.term(TermId(notation_info.term_num)));
         self.math_tok().unwrap();
         Some(
             if notation_info.rassoc {
@@ -353,7 +355,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     fn lhs(
         &mut self,
         a: MmzExpr<'b>,
-        (op0_term, op0_prec): (Term<'a>, Prec),
+        (op0_term, op0_prec): (TermRef<'a>, Prec),
         b: MmzExpr<'b>,
     ) -> Res<MmzExpr<'b>> {
         // If the next token in the math-string is an infix, such that op0_prec <= op1_prec,
@@ -364,14 +366,13 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             self.lhs(a, (op0_term, op0_prec), b_op_cprime)
         } else {
             // Next item is None or a weaker infix, so return `App { op1 a b }`
-            let mut plus_args = op0_term.args();
-            if let (Some(fst), Some(snd), Some(_), None) = (plus_args.next(), plus_args.next(), plus_args.next(), plus_args.next()) {
+            if let [fst, snd, _] = op0_term.args_and_ret() {
                 let a_coerced = self.coerce(a, fst.sort())?;
                 let b_coerced = self.coerce(b, snd.sort())?;
 
                 Ok(MmzExpr::App {
-                    term_num: op0_term.term_num,
-                    num_args: op0_term.num_args_no_ret(),
+                    term_num: op0_term.tid,
+                    num_args: u16::try_from(op0_term.args().len()).unwrap(),
                     args: self.alloc(bumpalo::vec![in self.bump; a_coerced, b_coerced]),
                     sort: op0_term.sort()
                 })

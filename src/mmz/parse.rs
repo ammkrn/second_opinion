@@ -1,7 +1,8 @@
+use std::convert::TryFrom;
 use std::sync::Arc;
 use std::collections::HashMap;
 use bumpalo::collections::Vec as BumpVec;
-use crate::mmb::stmt::StmtCmd;
+use mm0b_parser::NumdStmtCmd;
 use crate::mmz::{
     MmzState,
     MmzMem,
@@ -17,22 +18,18 @@ use crate::mmz::{
     Assoc
 };
 use crate::util::{ 
-    Mods, 
     Str, 
     Res, 
     VerifErr, 
-    SortNum,
-    Type,
     Either, 
-    Term, 
-    Assert, 
     Either::*, 
-    Args,
 };
 use crate::make_sure;
 use crate::localize;
 use crate::none_err;
-use crate::mmb::unify::{ UnifyCmd, UnifyIter, UMode };
+use mm0b_parser::{ UnifyCmd, Arg, Type, UnifyIter, TermRef, ThmRef };
+use mm0_util::{ SortId, Modifiers };
+use crate::mmb::unify::{ UMode };
 
 /// Demand a Prec::Num (err owise);
 /// 
@@ -88,28 +85,15 @@ pub fn trim(mut bytes: &[u8]) -> &[u8] {
 
 
 impl<'b, 'a: 'b> MmzMem<'a> {
-
-    pub fn is_empty(&self) -> bool {
-        self.mmz_pos == self.mmz.len()
-    }
-
-    pub fn cur(&self) -> Option<u8> {
-        self.mmz.get(self.mmz_pos).copied()
-    }
-
     pub fn cur_slice(&self) -> &'a [u8] {
         self.mmz.get(self.mmz_pos..).unwrap_or_else(|| &[])
     }
 
-    pub fn advance(&mut self, n: usize) {
-        self.mmz_pos += n;
-    }       
-
     pub fn parse_until(
         &mut self,
         bump: &mut bumpalo::Bump,
-        stmt_cmd: StmtCmd, 
-        item: Option<Either<Term<'a>, Assert<'a>>>
+        stmt_cmd: NumdStmtCmd, 
+        item: Option<Either<TermRef<'a>, ThmRef<'a>>>
     ) -> Res<()> {
         'outer: loop {
             'inner: loop {
@@ -123,13 +107,12 @@ impl<'b, 'a: 'b> MmzMem<'a> {
                     b"term" | b"def" => {
                         if let Some(L(t)) = item {
                             return mmz_st.parse_termdef(t)
-
                         } else {
                             return Err(VerifErr::Unreachable(file!(), line!()));
                         }
                     }
                     b"axiom" | b"theorem" => {
-                        make_sure!(matches!(stmt_cmd, StmtCmd::Axiom {..}) || matches!(stmt_cmd, StmtCmd::Thm {..}));
+                        make_sure!(matches!(stmt_cmd, NumdStmtCmd::Axiom {..}) || matches!(stmt_cmd, NumdStmtCmd::Thm {..}));
                         if let Some(R(assert)) = item {
                             return mmz_st.parse_assert(assert)
                         } else {
@@ -151,7 +134,7 @@ impl<'b, 'a: 'b> MmzMem<'a> {
                 continue 'outer
             } else {
                 return Err(VerifErr::Msg(
-                    format!("`parse_until` ran out of input with remaining verification obligations.")
+                    format!("`parse_until` ran out of input with remaining verification obligations. Remaining: {:?}", String::from_utf8_lossy(self.cur_slice()))
                 ))
             }
         }
@@ -188,7 +171,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     }
 
     /// Given an expression `(e: x)` and a target sort `z`, try to coerce an expression `(e: z)`
-    pub fn coerce(&mut self, e_x: MmzExpr<'b>, z: SortNum) -> Res<MmzExpr<'b>> {
+    pub fn coerce(&mut self, e_x: MmzExpr<'b>, z: SortId) -> Res<MmzExpr<'b>> {
         // If the task is coercion of `(e: z)` to `(e: z)`, just return `e`.
         if e_x.sort() == z { 
             return Ok(e_x)
@@ -413,7 +396,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         none_err!(self.kw(b"notation "))?;
         let ident = self.ident()?;
         let term = self.mem.get_term_by_ident(&ident)?;
-        let _binders = self.binders(term.args(), "notation")?;
+        let _binders = self.binders(term.args_and_ret(), "notation")?;
         localize!(self.guard(b'='))?;
         let prec_const = self.prec_const()?;
         let mut lits = vec![L(prec_const)];
@@ -437,9 +420,9 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         }
         // notation_literal
         self.elab_gen_nota(
-            term.term_num,
+            term.tid.into_inner(),
             ident,
-            term.num_args_no_ret(),
+            u16::try_from(term.args().len()).unwrap(),
             lits
         )?;
         localize!(self.guard(b';'))?;
@@ -562,12 +545,11 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     // You have a diamond.
     fn update_provs(&mut self) -> Res<()> {
         let mut provs = HashMap::with_hasher(Default::default());
-        for (s1, m) in self.mem.coes.iter() {
-            for s2 in m.keys() {
-                if self.mem.outline.get_sort_mods(*s2 as usize)?.is_provable() {
-                    if let Some(_s2) = provs.insert(*s1, *s2) {
-                        println!("Coercion diamond to provable detected");
-                        panic!();
+        for (&s1, m) in self.mem.coes.iter() {
+            for s2 in m.keys().copied() {
+                if self.mem.outline.file_view.mmb_sort_mods(s2)?.contains(Modifiers::PROVABLE) {
+                    if let Some(_s2) = provs.insert(s1, s2) {
+                        return Err(VerifErr::Msg(format!("Coercion diamond to provable detected. from: {:?}, to: {:?}", s1, s2)))
                     }
                 }
             }
@@ -577,10 +559,10 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     fn add_coe(
         &mut self,
-        term: Term,
+        term: TermRef,
         _term_ident: Str<'a>,
-        from: u8,
-        to: u8,
+        from: SortId,
+        to: SortId,
     ) -> Res<()> {
         self.add_coe_raw(term, from, to)?;
         self.update_provs()?;
@@ -603,19 +585,19 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     /// 3. Make sure we didn't create any diamonds.
     fn add_coe_raw(
         &mut self,
-        term: Term,
-        x: u8,
-        y: u8,
+        term: TermRef,
+        x: SortId,
+        y: SortId,
     ) -> Res<()> {
         // If the coercion `x > y` already exists, do nothing, otherwise continue
         // knowing that `x > y` is unique.
         match self.mem.coes.get(&x).and_then(|m| m.get(&y)) {
-            Some(&Coe::Single { term_num }) if term_num == term.term_num => return Ok(()),
+            Some(&Coe::Single { term_num }) if term_num == term.tid => return Ok(()),
             _ => {}
         }
 
         // Make the new coercion `x > y` with whatever term_num corresponds to `my_coe`.
-        let coe_x_y = Arc::new(Coe::Single { term_num: term.term_num });
+        let coe_x_y = Arc::new(Coe::Single { term_num: term.tid });
 
         // Holds:
         // 1. The original coercion `x > y`
@@ -677,12 +659,12 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     fn elab_coe(
         &mut self,
-        term: Term,
+        term: TermRef,
         term_ident: Str<'a>,
-        from: u8,
-        to: u8,
+        from: SortId,
+        to: SortId,
     ) -> Res<()> {
-        assert_eq!(term.num_args_no_ret(), 1);
+        assert_eq!(term.args().len(), 1);
         self.add_coe(term, term_ident, from, to)
     }    
 
@@ -696,8 +678,8 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         localize!(self.guard(b';'))?;
 
         let term = self.mem.get_term_by_ident(&ident)?;
-        let from_num = self.mem.get_sort_num(from)?;
-        let to_num = self.mem.get_sort_num(to)?;
+        let from_num = self.mem.get_sort_id(from)?;
+        let to_num = self.mem.get_sort_id(to)?;
         self.elab_coe(term, ident, from_num, to_num)
     }
 
@@ -732,14 +714,14 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     fn elab_simple_prefix(
         &mut self,
         term_ident: Str<'a>,
-        term: Term<'a>,
+        term: TermRef<'a>,
         constant: Str<'a>,
         prec: Prec,         
     ) -> Res<()> {
         let mut lits = Vec::new();
 
         // This is now all_args - 2
-        if let Some(n) = term.num_args_no_ret().checked_sub(1) {
+        if let Some(n) = term.args().len().checked_sub(1) {
             for i in 0..n {
                 lits.push(NotationLit::Var {
                     pos: i as usize,
@@ -752,7 +734,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         self.add_const(constant, prec)?;
 
         let info = NotationInfo {
-            term_num: term.term_num,
+            term_num: term.tid.into_inner(),
             term_ident,
             rassoc: true,
             lits: Arc::from(lits),
@@ -765,7 +747,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         //.push((constant, Some(Fix::Prefix)));        
 
         // 0-ary prefixes don't affect the occupied map.
-        if term.num_args_no_ret() > 0 {
+        if term.args().len() > 0 {
             self.mem.occupy_prec(term_ident, prec, Assoc::Right)?;
         }
 
@@ -779,7 +761,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     fn elab_simple_infix(
         &mut self,
         term_ident: Str<'a>,
-        term: Term<'a>,
+        term: TermRef<'a>,
         constant: Str<'a>,
         prec: Prec,         
         is_infixr: bool,
@@ -788,9 +770,9 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             Prec::Max => return Err(VerifErr::Msg(format!("Max not allowed for simple infix notations"))),
             Prec::Num(n) => {
                 let i2 = none_err!(n.checked_add(1))?;
-                if term.num_args_no_ret() != 2 {
+                if term.args().len() != 2 {
                     return localize!(Err(VerifErr::Msg(
-                        format!("infix notations must be for terms with 2 arguments. {:?} had {}", term_ident, term.num_args_no_ret())
+                        format!("infix notations must be for terms with 2 arguments. {:?} had {}", term_ident, term.args().len())
                     )))
                 }
                 let lits = if is_infixr {
@@ -810,7 +792,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                 self.add_const(constant, prec)?;
 
                 let info = NotationInfo {
-                    term_num: term.term_num,
+                    term_num: term.tid.into_inner(),
                     term_ident,
                     rassoc: is_infixr,
                     lits: Arc::from(lits),
@@ -834,17 +816,17 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         }
     }
 
-    fn sort(&mut self) -> Res<(Str<'a>, Mods)> {
-        let mut mods = Mods::new();
+    fn sort(&mut self) -> Res<(Str<'a>, Modifiers)> {
+        let mut mods = Modifiers::empty();
         while let Some(_) = self.cur() {
             if self.kw(b"provable ").is_some() {
-                mods |= Mods::provable();
+                mods.insert(Modifiers::PROVABLE);
             } else if self.kw(b"strict ").is_some() {
-                mods |= Mods::strict();
+                mods.insert(Modifiers::STRICT);
             } else if self.kw(b"pure ").is_some() {
-                mods |= Mods::pure();
+                mods.insert(Modifiers::PURE);
             } else if self.kw(b"free ").is_some() {
-                mods |= Mods::free();
+                mods.insert(Modifiers::FREE);
             } else if self.kw(b"sort ").is_some() {
                 break;
             } else {
@@ -859,23 +841,22 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     pub fn parse_sort(&mut self) -> Res<()> {
         let (ident, mods) = self.sort()?;
-        let mmb_mods = self.mem.outline.get_sort_mods(self.mem.num_sorts_done() as usize)?;
+        let mmb_mods = self.mem.outline.file_view.mmb_sort_mods(self.mem.num_sorts_done())?;
         make_sure!(mods == mmb_mods);
-        self.mem.add_sort(ident);
+        self.mem.add_sort(ident)?;
         Ok(())
     }
 
     pub fn parse_termdef(
         &mut self, 
-        term: Term<'a>,
+        term: TermRef<'a>,
     ) -> Res<()> {
         make_sure!(self.kw(b"term ").or(self.kw(b"def ")).is_some());
         let ident = self.ident()?;
+        let mode = if term.def() { "def" } else { "term" };
+        self.binders(term.args_and_ret(), mode)?;
 
-        let mode = if term.is_def() { "def" } else { "term" };
-        self.binders(term.args(), mode)?;
-
-        if term.is_def() && self.peek_word() == b"=" {
+        if term.def() && self.peek_word() == b"=" {
             localize!(self.guard(b'='))?;
             let rhs_e = self.expr_()?;
             let rhs_e = self.coerce(rhs_e, self.mem.coe_prov_or_else(rhs_e.sort()))?;
@@ -890,7 +871,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     /// Parse an `axiom` or a `theorem` from a .mm0 file
     pub fn parse_assert(
         &mut self, 
-        assert: Assert<'a>,
+        assert: ThmRef<'a>,
     ) -> Res<()> {
         make_sure!(self.kw(b"axiom ").or(self.kw(b"theorem ")).is_some());
         let ident = self.ident().unwrap();
@@ -927,7 +908,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
 
     fn binders(
         &mut self, 
-        args: Args<'a>,
+        args: &[Arg],
         mode: &str,
     ) -> Res<()> {
         // This rolling back of the binders on failure is just to make eventual error-reporting
@@ -938,7 +919,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         // iter_n.. (ph ps: wff x)
         while let Some(_) = self.cur() {
             // The portion of the declaration's arguments that we haven't yet parsed.
-            let args_todo = args.skip(self.non_dummy_vars().count());
+            let args_todo = args.iter().copied().skip(self.non_dummy_vars().count());
             match self.binder_group(args_todo, mode) {
                 Ok(_) => {
                     todo_len = self.vars_todo.len();
@@ -954,7 +935,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         }
 
         localize!(self.guard(b':'))?;
-        let args_todo = args.skip(self.non_dummy_vars().count());
+        let args_todo = args.iter().copied().skip(self.non_dummy_vars().count());
         self.return_ty(args_todo, mode)
     }
 
@@ -973,7 +954,8 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         Ok(())
     }
 
-    fn binder_group(&mut self, args_todo: std::iter::Skip<Args<'a>>, mode: &str) -> Res<()> {
+    fn binder_group<I>(&mut self, args_todo: I, mode: &str) -> Res<()> 
+    where I: Iterator<Item = Arg> + ExactSizeIterator {
         let opener = localize!(self.guard(b'(').or(self.guard(b'{')))?;
         let num_non_dummy_before = self.non_dummy_vars().count();
         // Get the variable idents/names, put them in `vars_todo` until we know their type
@@ -1037,15 +1019,16 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     /// where `x` and `y` are previously declared dependencies.
     fn binder_dep_ty(&mut self, bound: bool) -> Res<()> {
         let sort_ident = self.ident()?;
-        let sort_num = self.mem.get_sort_num(sort_ident)?;
+        let sort_id = self.mem.get_sort_id(sort_ident)?;
+        // Needs to make a new bound type
         let mut ty_accum = Type::new(bound);
-        ty_accum.add_sort(sort_num);
+        ty_accum.add_sort(sort_id);
         if bound {
-            ty_accum.inner |= self.take_next_bv();
+            ty_accum |= Type::from(self.take_next_bv());
         } else {
             while let Ok(dep_ident) = self.ident() {
                 make_sure!(!bound);
-                let dep_pos = 1 + none_err!(self.potential_deps().position(|v| v.ident == Some(dep_ident)))?;
+                let dep_pos = none_err!(self.potential_deps().position(|v| v.ident == Some(dep_ident)))?;
                 ty_accum.add_dep(dep_pos as u64);
             }
         }
@@ -1062,7 +1045,8 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         Ok(())
     }
 
-    fn return_ty(&mut self, mut arrow_args: std::iter::Skip<Args<'a>>, mode: &str) -> Res<()> {
+    fn return_ty<I>(&mut self, mut arrow_args: I, mode: &str) -> Res<()> 
+    where I: Iterator<Item = Arg> + ExactSizeIterator + Clone {
         while let Some(_) = self.cur() {
             // If it's a hypothesis
             if let Some(b'$') = { self.skip_ws(); self.cur() } {
@@ -1073,11 +1057,11 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
             } else {
                 // If it's an arrow type.
                 let sort_ident = self.ident()?;
-                let sort_num = self.mem.get_sort_num(sort_ident)?;
-                let mut ty_accum = Type::new_with_sort(sort_num);
+                let sort_id = self.mem.get_sort_id(sort_ident)?;
+                let mut ty_accum = Type::new_of_sort(sort_id.into_inner());
 
                 while let Ok(dep_ident) = self.ident() {
-                    let dep_pos = 1 + none_err!(self.potential_deps().position(|v| v.ident == Some(dep_ident)))?;
+                    let dep_pos = none_err!(self.potential_deps().position(|v| v.ident == Some(dep_ident)))?;
                     ty_accum.add_dep(dep_pos as u64);
                 }
                 // Type-check the return type.
@@ -1106,7 +1090,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
         }
 
         for maybe_cmd in u {
-            match maybe_cmd? {
+            match maybe_cmd.map_err(|e| VerifErr::Msg(format!("{}", e)))? {
                 UnifyCmd::Ref(i) => {
                     let heap_elem = *&self.uheap[i as usize];
                     let stack_elem = none_err!(self.ustack.pop())?;
@@ -1114,10 +1098,10 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                         return Err(VerifErr::Msg(format!("check_expr Ref eq test went bad")))
                     }
                 }
-                UnifyCmd::Term { term_num, save } => {
+                UnifyCmd::Term { tid, save } => {
                     let p = none_err!(self.ustack.pop())?;
                     if let MmzExpr::App { term_num:n2, args, .. } = p {
-                        make_sure!(term_num == n2);
+                        make_sure!(tid == n2);
                         self.ustack.extend(args.into_iter().rev());
                         if save {
                             self.uheap.push(p);
@@ -1126,7 +1110,7 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
                         return Err(VerifErr::Msg(format!("UnifyCmd expected term")))
                     }
                 },
-                UnifyCmd::Dummy { sort_id } => {
+                UnifyCmd::Dummy(sort_id) => {
                     make_sure!(mode == UMode::UDef);
                     let p = none_err!(self.ustack.pop())?;
                     if let MmzExpr::Var(MmzVar { ty, is_dummy, .. }) = p {

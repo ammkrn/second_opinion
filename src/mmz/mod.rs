@@ -14,18 +14,14 @@ use crate::Outline;
 use crate::util::{ 
     Either::*,
     Str,
-    SortNum,
-    TermNum,
-    AssertNum,
     SortIdent,
     TermIdent,
     AssertIdent,
     VerifErr,
     Res,
-    Type,
-    Term
 };
-use crate::mmb::stmt::StmtCmd;
+use mm0_util::{ Modifiers, SortId, TermId, ThmId };
+use mm0b_parser::{ NumdStmtCmd, TermRef, Type };
 
 pub type MathStr<'b, 'a> = BumpVec<'b, Str<'a>>;
 
@@ -34,15 +30,15 @@ pub type MathStr<'b, 'a> = BumpVec<'b, Str<'a>>;
 pub enum MmzExpr<'b> {
     Var(MmzVar<'b>),
     App {
-        term_num: u32,
+        term_num: TermId,
         num_args: u16,
         args: &'b [MmzExpr<'b>],
-        sort: SortNum,
+        sort: SortId,
     },
 }
 
 impl<'b> MmzExpr<'b> {
-    fn sort(self) -> SortNum {
+    fn sort(self) -> SortId {
         match self {
             MmzExpr::Var(v) => v.sort(),
             MmzExpr::App { sort, .. } => sort
@@ -67,28 +63,13 @@ pub struct MmzVar<'a> {
 
 impl<'a> MmzVar<'a> {
     pub fn is_bound(self) -> bool {
-        self.ty.is_bound()
+        self.ty.bound()
     }
 
-    pub fn sort(self) -> u8 {
+    pub fn sort(self) -> SortId {
         self.ty.sort()
     }
 }
-
-//#[derive(Debug)]
-//pub struct DeclaredNotation<'a> {
-//    pub has_coe: bool,
-//    pub consts: Vec<(Str<'a>, Option<Fix>)>
-//}
-
-//impl<'a> std::default::Default for DeclaredNotation<'a> {
-//    fn default() -> Self {
-//        DeclaredNotation {
-//            has_coe: false,
-//            consts: Vec::new()
-//        }
-//    }
-//}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DelimKind {
@@ -177,7 +158,7 @@ pub enum NotationLit<'a> {
 pub enum Coe {
     // term_id
     Single {
-        term_num: TermNum,
+        term_num: TermId,
     },
     // transitive
     // `Trans(c1, m, c2)` asserts that `c1: s1 -> m` and `c2: m -> s2` (so we get a transitive
@@ -186,7 +167,7 @@ pub enum Coe {
         // (sA -> sB)
         c1: Arc<Coe>,
         // sB
-        middleman_sort: SortNum,
+        middleman_sort: SortId,
         // (sB -> sC)
         c2: Arc<Coe>
     },
@@ -274,19 +255,17 @@ pub struct MmzMem<'a> {
     /// (prefix w/ arity > 0) /\ general ending with a variable are Rassoc
     /// 0ary prefix /\ general ending with a const don't affect the map.
     pub occupied_precs: HashMap<Prec, Assoc>,    
-    // unneeded
-    //pub declared_notations: FxIndexMap<Str<'a>, DeclaredNotation<'a>>,
-    pub nonlocal_termdefs: HashMap<TermIdent<'a>, TermNum>,
-    pub nonlocal_asserts: HashMap<AssertIdent<'a>, AssertNum>,
+    pub nonlocal_termdefs: HashMap<TermIdent<'a>, TermId>,
+    pub nonlocal_asserts: HashMap<AssertIdent<'a>, ThmId>,
     sorts: Vec<SortIdent<'a>>,
-    pub provs: HashMap<SortNum, bool>,
+    pub provs: HashMap<SortId, bool>,
     /// `sort_id |-> [sort_id |-> coe]`
     ///
     /// A map of sort pairs `s1/from, s2/to` to the coercion `c: s1 -> s2`.
-    pub coes: HashMap<SortNum, HashMap<SortNum, Coe>>,
+    pub coes: HashMap<SortId, HashMap<SortId, Coe>>,
     /// A map of sorts `s` to some sort `t` such that `t` is provable and `c: s -> t` is in `coes`,
     /// if one exists.
-    pub coe_prov: HashMap<SortNum, SortNum>,
+    pub coe_prov: HashMap<SortId, SortId>,
 
     num_sorts: u8,
     num_termdefs: u32,
@@ -301,8 +280,8 @@ impl<'a> MmzMem<'a> {
     pub fn new_from(outline: &'a Outline<'a>) -> Res<Self> {
         Ok(MmzMem {
             outline,
-            mmz: none_err!(outline.file_data.mmz_files.first())?.as_bytes(),
-            mmz_files: outline.file_data.mmz_files.as_slice(),
+            mmz: none_err!(outline.file_view.mmz.first())?.as_bytes(),
+            mmz_files: outline.file_view.mmz,
             mmz_pos: 0usize,
             mmz_file_num: 0usize,
         
@@ -312,7 +291,6 @@ impl<'a> MmzMem<'a> {
             prefixes: HashMap::new(),
             infixes: HashMap::new(),
             occupied_precs: HashMap::new(),
-            //declared_notations: FxIndexMap::with_hasher(Default::default()),
             nonlocal_termdefs: HashMap::new(),
             nonlocal_asserts: HashMap::new(),
             sorts: Vec::new(),
@@ -325,16 +303,16 @@ impl<'a> MmzMem<'a> {
         })
     }        
 
-    pub fn verify1(&mut self, bump: &mut Bump, stmt: StmtCmd) -> Res<()> {
+    pub fn verify1(&mut self, bump: &mut Bump, stmt: NumdStmtCmd) -> Res<()> {
         if !stmt.is_local() {
             let item = match stmt {
-                StmtCmd::Sort {..} => None,
-                StmtCmd::TermDef {..} => {
-                    let term = self.outline.get_term_by_num(self.num_termdefs_done())?;
+                NumdStmtCmd::Sort {..} => None,
+                NumdStmtCmd::TermDef {..} => {
+                    let term = none_err!(self.outline.file_view.mmb.term(TermId(self.num_termdefs_done())))?;
                     Some(L(term))
                 }
-                StmtCmd::Axiom {..} | StmtCmd::Thm {..} => {
-                    let assert = self.outline.get_assert_by_num(self.num_asserts_done())?;
+                NumdStmtCmd::Axiom {..} | NumdStmtCmd::Thm {..} => {
+                    let assert = none_err!(self.outline.file_view.mmb.thm(ThmId(self.num_asserts_done())))?;
                     Some(R(assert))
                 }
             };
@@ -350,41 +328,41 @@ impl<'a> MmzMem<'a> {
     }
 
 
-    pub fn coe_prov_or_else(&self, from: SortNum) -> SortNum {
+    pub fn coe_prov_or_else(&self, from: SortId) -> SortId {
         self.coe_prov.get(&from).copied().unwrap_or(from)
     }
 
 
-    pub fn add_termdef(&mut self, ident: Str<'a>) -> TermNum {
-        let idx = self.num_termdefs;
+    pub fn add_termdef(&mut self, ident: Str<'a>) -> TermId {
+        let idx = TermId(self.num_termdefs);
         assert!(self.nonlocal_termdefs.insert(ident, idx).is_none());
         idx
     }
 
-    pub fn add_assert(&mut self, ident: Str<'a>) -> AssertNum {
-        let idx = self.num_asserts;
+    pub fn add_assert(&mut self, ident: Str<'a>) -> ThmId {
+        let idx = ThmId(self.num_asserts);
         assert!(self.nonlocal_asserts.insert(ident, idx).is_none());
 
         idx
     }
 
-    pub fn get_sort_num(&self, ident: Str<'a>) -> Res<u8> {
+    pub fn get_sort_id(&self, ident: Str<'a>) -> Res<SortId> {
         let idx = none_err!(self.sorts.iter().position(|s| *s == ident))?;
-        conv_err!(u8::try_from(idx))
+        conv_err!(u8::try_from(idx).map(|n| SortId(n)))
     }
 
-    pub fn add_sort(&mut self, ident: Str<'a>) -> SortNum {
+    pub fn add_sort(&mut self, ident: Str<'a>) -> Res<SortId> {
         let idx = self.sorts.len();
         assert!(!self.sorts.iter().any(|x| *x == ident));
         self.sorts.push(ident);
-        let sort_num = u8::try_from(idx).unwrap();
-        let mods = self.outline.get_sort_mods(idx).unwrap();
-        assert!(self.provs.insert(sort_num, mods.is_provable()).is_none());
-        sort_num
+        let sort_id = SortId(u8::try_from(idx).unwrap());
+        let is_provable = self.outline.file_view.mmb_sort_mods(sort_id)?.contains(Modifiers::PROVABLE);
+        assert!(self.provs.insert(sort_id, is_provable).is_none());
+        Ok(sort_id)
     }
 
-    pub fn num_sorts_done(&self) -> u8{
-        self.num_sorts
+    pub fn num_sorts_done(&self) -> SortId {
+        SortId(self.num_sorts)
     }
     pub fn num_termdefs_done(&self) -> u32 {
         self.num_termdefs
@@ -393,17 +371,17 @@ impl<'a> MmzMem<'a> {
         self.num_asserts
     }
 
-    pub fn add_declar(&mut self, stmt_cmd: StmtCmd) {
+    pub fn add_declar(&mut self, stmt_cmd: NumdStmtCmd) {
         match stmt_cmd {
-            StmtCmd::Sort {..} => self.num_sorts += 1,
-            StmtCmd::TermDef {..} => self.num_termdefs += 1,
-            StmtCmd::Axiom {..} | StmtCmd::Thm {..} => self.num_asserts += 1,
+            NumdStmtCmd::Sort {..} => self.num_sorts += 1,
+            NumdStmtCmd::TermDef {..} => self.num_termdefs += 1,
+            NumdStmtCmd::Axiom {..} | NumdStmtCmd::Thm {..} => self.num_asserts += 1,
         }
     }
 
-    pub fn get_term_by_ident(&self, ident: &Str<'a>) -> Res<Term<'a>> {
+    pub fn get_term_by_ident(&self, ident: &Str<'a>) -> Res<TermRef<'a>> {
         let term_num = none_err!(self.nonlocal_termdefs.get(ident).copied())?;
-        self.outline.get_term_by_num(term_num)
+        none_err!(self.outline.file_view.mmb.term(term_num))
     }        
 
     pub fn occupy_prec(&mut self, term_ident: Str<'a>, prec: Prec, assoc: Assoc) -> Res<()> {
@@ -426,7 +404,6 @@ pub struct MmzState<'b, 'a: 'b> {
     ustack: BumpVec<'b, MmzExpr<'b>>,
     uheap: BumpVec<'b, MmzExpr<'b>>,
     pub next_bv: u64    
-
 }
 
 impl<'b, 'a: 'b> MmzState<'b, 'a> {
@@ -465,11 +442,6 @@ impl<'b, 'a: 'b> MmzState<'b, 'a> {
     /// Produce the list of potential dependencies (bound variables that are not dummies)
     pub fn potential_deps(&self) -> impl Iterator<Item = MmzVar> {
         self.non_dummy_vars().filter(|v| v.is_bound())
-    }
-
-    /// Produce an iterator with the same elements as what an Mmb `Args` should have ()
-    pub fn args_iter(&self) -> impl Iterator<Item = MmzVar> {
-        self.vars_done.iter().copied().filter(|v| !v.is_dummy)
     }
 
     pub fn is_empty(&self) -> bool {

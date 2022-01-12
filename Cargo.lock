@@ -281,9 +281,9 @@ dependencies = [
 
 [[package]]
 name = "mm0_util"
-version = "0.1.1"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "090636d7523af313f8f203353586da47decb2ef08a6a8d76bd80230e1da8feff"
+checksum = "22cee3d13265fcdecc6fb1dd05d6a0e516e7f3bdc223b57d21109686aca19190"
 dependencies = [
  "bitflags",
  "lazy_static",
@@ -296,9 +296,9 @@ dependencies = [
 
 [[package]]
 name = "mm0b_parser"
-version = "0.1.0"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d02b1b407d41d9f359719ceb14729a30da929c81f0b8ba1783ce43bb39b2ceba"
+checksum = "908327387657a2adc5231e72c7873ae4aa6e35281185ef146a750e173fda65b5"
 dependencies = [
  "byteorder",
  "memchr",
@@ -498,7 +498,7 @@ checksum = "71d301d4193d031abdd79ff7e3dd721168a9572ef3fe51a1517aba235bd8f86e"
 
 [[package]]
 name = "second_opinion"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bumpalo",
  "clap",
@@ -725,9 +725,9 @@ checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "zerocopy"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab9379fdcbd16727ce6f7f098154c35d303f092ba4c8e20719f584ad29b8aa47"
+checksum = "5e59ec1d2457bd6c0dd89b50e7d9d6b0b647809bf3f0a59ac85557046950b7b2"
 dependencies = [
  "byteorder",
  "zerocopy-derive",
@@ -735,9 +735,9 @@ dependencies = [
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.2.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d498dbd1fd7beb83c86709ae1c33ca50942889473473d287d56ce4770a18edfb"
+checksum = "a0fbc82b82efe24da867ee52e015e58178684bd9dd64c34e66bdf21da2582a9f"
 dependencies = [
  "proc-macro2 1.0.24",
  "syn 1.0.60",

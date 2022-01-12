@@ -97,7 +97,7 @@ impl<'b, 'a: 'b> MmzMem<'a> {
     ) -> Res<()> {
         'outer: loop {
             'inner: loop {
-                let mut mmz_st = MmzState::new_from(&mut *self, bump);
+                let mut mmz_st = MmzState::new_from(self, bump);
                 if mmz_st.cur().is_none() {
                     break 'inner
                 }

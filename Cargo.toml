@@ -1,6 +1,6 @@
 [package]
 name = "second_opinion"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["ammkrn"]
 edition = "2018"
 
@@ -15,8 +15,8 @@ overflow-checks=true
 debug=true
 
 [dependencies]
+bumpalo = { version = "3.5.0", features = ["collections"] }
 clap = "2.33.3"
 crossbeam-utils = "0.8.1"
-bumpalo = { version = "3.5.0", features = ["collections"] }
-mm0_util = "0.1.1"
-mm0b_parser = "0.1.0"
+mm0_util = "0.1.4"
+mm0b_parser = "0.1.4"
